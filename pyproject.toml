@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kaggle-runner"
+version = "0.1.0"
+description = "Portable Kaggle notebook execution and dataset management CLI"
+readme = "docs/P0_PORTABLE_RUNNER.md"
+requires-python = ">=3.11"
+authors = [{name = "Kaggle Runner contributors"}]
+dependencies = []
+
+[project.optional-dependencies]
+kaggle = ["kaggle>=1.7"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+kgr = "kaggle_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kaggle_runner*"]
