@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kaggle-runner"
 version = "0.1.0"
-description = "Portable Kaggle notebook execution and dataset management CLI"
-readme = "docs/P0_PORTABLE_RUNNER.md"
+description = "Run Python experiments on Kaggle Notebooks and collect results"
+readme = "README.md"
 requires-python = ">=3.11"
 authors = [{name = "Kaggle Runner contributors"}]
 dependencies = []
