@@ -22,6 +22,10 @@ def _emit(value: dict | list, *, as_json: bool = True) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False, default=str), flush=True)
 
 
+def _progress(message: str) -> None:
+    print(f"kgr: {message}", file=sys.stderr, flush=True)
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kgr", description="Portable Kaggle Python repo runner")
     p.add_argument("--config", help="Optional TOML config (default: XDG_CONFIG_HOME/kaggle-runner/config.toml)")
@@ -46,8 +50,17 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
     check.add_argument("--required-gpu-hours", type=float, default=0.25)
     check.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2)
+    for command in (check,):
+        command.add_argument("--workers", type=int, default=6, help="Concurrent status requests (1-16)")
+        command.add_argument("--max-seconds", type=float, default=45, help="Total active-scan time budget")
+        command.add_argument("--strict", action="store_true", help="Verify historical terminal entries live (slower)")
+        command.add_argument("--quiet", action="store_true", help="Disable progress messages on stderr")
     sub.add_parser("quota", help="Check remaining GPU quota")
-    sub.add_parser("active", help="Check running/queued Kaggle batch kernels")
+    active = sub.add_parser("active", help="Check running/queued Kaggle batch kernels")
+    active.add_argument("--workers", type=int, default=6, help="Concurrent status requests (1-16)")
+    active.add_argument("--max-seconds", type=float, default=45, help="Total active-scan time budget")
+    active.add_argument("--strict", action="store_true", help="Verify historical terminal entries live (slower)")
+    active.add_argument("--quiet", action="store_true", help="Disable progress messages on stderr")
     report = sub.add_parser("report", help="Summarize local jobs and optionally refresh remote status")
     report.add_argument("--refresh", action="store_true", help="Query remote statuses")
     report.add_argument("--limit", type=int, default=100)
@@ -67,6 +80,10 @@ def parser() -> argparse.ArgumentParser:
                    help="Minimum hours needed before GPU submit (default 0.25)")
     r.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2,
                    help="Local safety cap on concurrently active batch kernels (default 2)")
+    r.add_argument("--workers", type=int, default=6, help="Concurrent preflight status requests (1-16)")
+    r.add_argument("--max-seconds", type=float, default=45, help="Preflight active-scan time budget")
+    r.add_argument("--strict", action="store_true", help="Verify historical terminal entries live")
+    r.add_argument("--quiet", action="store_true", help="Disable preflight progress messages")
     r.add_argument("--dataset", action="append", default=[], metavar="OWNER/SLUG", help="Attach a Kaggle dataset (repeatable; public resources need no download)")
     r.add_argument("--model", action="append", default=[], metavar="OWNER/MODEL/FRAMEWORK/VARIATION/VERSION", help="Attach a pinned Kaggle Model variation version (repeatable)")
     r.add_argument("--unpack-datasets", action="store_true", help="Unzip payload.zip attached datasets into Kaggle working")
@@ -145,11 +162,13 @@ def dispatch(a: argparse.Namespace) -> int:
         if a.command == "quota":
             _emit(quota_report(cli))
             return 0
+        scan_kwargs = {"workers": a.workers, "max_seconds": a.max_seconds,
+                       "strict": a.strict, "progress": None if a.quiet else _progress}
         if a.command == "active":
-            _emit(active_report(cli))
+            _emit(active_report(cli, **scan_kwargs))
             return 0
         result = check_preflight(cli, gpu=a.gpu, required_gpu_hours=a.required_gpu_hours,
-                                 max_concurrent=a.max_concurrent)
+                                 max_concurrent=a.max_concurrent, **scan_kwargs)
         _emit(result)
         return 0 if result["ok"] else 3
     if a.command == "doctor":
@@ -237,7 +256,9 @@ def dispatch(a: argparse.Namespace) -> int:
         owner = a.owner or account.owner or config.get("runner", {}).get("owner")
         if not a.dry_run:
             preflight = check_preflight(cli, gpu=a.gpu, required_gpu_hours=a.required_gpu_hours,
-                                        max_concurrent=a.max_concurrent)
+                                        max_concurrent=a.max_concurrent,
+                                        workers=a.workers, max_seconds=a.max_seconds,
+                                        strict=a.strict, progress=None if a.quiet else _progress)
             if not preflight["ok"]:
                 raise RunnerError("Preflight blocked submission: " + "; ".join(preflight["reasons"]))
         result = create_job(settings, cli, store, source=source, entry=entry, owner=owner,

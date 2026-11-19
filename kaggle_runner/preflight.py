@@ -9,7 +9,9 @@ import csv
 import io
 import json
 import re
-from typing import Any
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+from typing import Any, Callable
 
 from .api import KaggleCLI
 from .config import RunnerError
@@ -61,18 +63,26 @@ def parse_gpu_quota(raw: str) -> dict:
         for item in root:
             if isinstance(item, dict):
                 normalized = _norm(item)
-                tag = str(normalized.get("accelerator") or normalized.get("name") or normalized.get("type") or "").lower()
+                tag = str(normalized.get("resource") or normalized.get("accelerator") or normalized.get("name") or normalized.get("type") or "").lower()
                 if "gpu" in tag:
                     candidates.append(item)
     elif isinstance(root, dict):
         norm = _norm(root)
+        # A single row is also valid input for diagnostics. The official CLI
+        # normally returns a list of rows labelled with `resource: GPU`.
+        if str(norm.get("resource", "")).strip().lower() == "gpu":
+            candidates.append(root)
         for key, value in norm.items():
             if key in {"gpu", "gpuquota", "gpuquotahours", "gpuaccelerator"} and isinstance(value, dict):
                 candidates.append(value)
         if not candidates and any("gpu" in key and ("remaining" in key or "used" in key) for key in norm):
             candidates.append({re.sub(r"^gpu", "", k): v for k, v in norm.items() if k.startswith("gpu")})
     if not candidates:
-        raise RunnerError("Kaggle quota response has no recognizable GPU quota")
+        raise RunnerError(
+            "Kaggle quota response has no recognizable GPU row "
+            "(expected resource=GPU with used/remaining/total fields). "
+            "Check `python -m kaggle quota --format json`."
+        )
     n = _norm(candidates[0])
     used = next((_hours(n[key]) for key in ("usedhours", "timeused", "used") if key in n), None)
     total = next((_hours(n[key]) for key in ("totalhours", "totaltimeallowed", "total", "allowedhours") if key in n), None)
@@ -82,6 +92,7 @@ def parse_gpu_quota(raw: str) -> dict:
     if remaining is None:
         raise RunnerError("GPU quota remaining hours not available in Kaggle response")
     return {"remaining_hours": round(remaining, 3), "used_hours": used, "total_hours": total,
+            "refresh_at": n.get("refreshat"),
             "note": "Snapshot only; running sessions may reserve additional hours"}
 
 
@@ -93,9 +104,9 @@ def quota_report(cli: KaggleCLI) -> dict:
     return parse_gpu_quota(result.stdout)
 
 
-def _list_page(cli: KaggleCLI, page: int, size: int) -> list[dict]:
+def _list_page(cli: KaggleCLI, page: int, size: int, timeout_seconds: float = 12) -> list[dict]:
     response = cli.call("kernels", "list", "--mine", "--format", "json", "--sort-by", "dateRun",
-                        "--page", str(page), "--page-size", str(size))
+                        "--page", str(page), "--page-size", str(size), timeout_seconds=timeout_seconds)
     try:
         obj = json.loads(response.stdout)
     except ValueError as exc:
@@ -147,14 +158,93 @@ def _session_not_found(message: str) -> bool:
     return bool(re.search(r"\b(?:resource|kernel|notebook|session)\s+(?:was\s+)?not found\b|\b404\b", message, re.IGNORECASE))
 
 
-def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5, limit: int = 2) -> dict:
-    seen = set()
+def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
+                  limit: int = 2, workers: int = 6, max_seconds: float = 45,
+                  status_timeout_seconds: float = 10, strict: bool = False,
+                  progress: Callable[[str], None] | None = None) -> dict:
+    """Count active batch kernels without sequentially querying hundreds of runs.
+
+    Status lookups are parallel but bounded in small batches. Progress is caller-
+    supplied (the CLI writes it to stderr, keeping stdout machine-readable).
+    Older *explicitly terminal* list entries can be treated as historical in
+    default mode; `strict=True` verifies every entry live, with a time limit.
+    This remains a best-effort batch snapshot, not a reservation of Kaggle slots.
+    """
+    if workers < 1 or workers > 16 or max_seconds <= 0 or status_timeout_seconds <= 0:
+        raise RunnerError("--workers must be 1-16, --max-seconds and timeout must be positive")
+    if max_pages < 1 or page_size < 1:
+        raise RunnerError("Invalid Kaggle pagination settings")
+
+    def notify(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    deadline = time.monotonic() + max_seconds
+    seen: set[str] = set()
     active: list[dict] = []
     not_started: list[dict] = []
     missing_sessions: list[dict] = []
     scanned = 0
+    live_checked = 0
+    listed_terminal = 0
+    # Kaggle list --sort-by dateRun places recent runs first. Even in fast mode
+    # verify the newest entries, including those listed as COMPLETE. This helps
+    # avoid trusting an immediately stale list snapshot during a new submission.
+    recent_verify = 20
+    batch_size = workers * 2
+
+    def snapshot() -> dict:
+        return {"running_count": len(active), "max_concurrent": limit,
+                "has_slot": len(active) < limit, "active": active, "scanned": scanned,
+                "live_checked_count": live_checked,
+                "listed_terminal_count": listed_terminal,
+                "missing_sessions": missing_sessions,
+                "missing_session_count": len(missing_sessions),
+                "not_started": not_started, "not_started_count": len(not_started),
+                "strict": strict,
+                "note": "Best-effort batch-kernel snapshot, not a slot reservation. "
+                        "Older completed entries may be taken from list status in fast mode; "
+                        "interactive sessions may not be included"}
+
+    def probe(ref: str, row: dict, timeout: float) -> tuple[str, str, str]:
+        try:
+            res = cli.call("kernels", "status", ref, check=False, timeout_seconds=timeout)
+        except RunnerError as exc:
+            raise RunnerError(f"Could not verify remote kernel status for {ref}: {exc}") from exc
+        if res.returncode:
+            if _session_not_found(res.text):
+                listed = _listed_status(row)
+                if listed in ACTIVE:
+                    raise RunnerError(
+                        f"Kaggle reports {ref} as {listed} in its notebook list "
+                        "but the live session status is missing; refusing to guess "
+                        "whether a concurrent slot is free"
+                    )
+                return ref, "missing", listed
+            raise RunnerError(f"Could not verify remote kernel status for {ref}: {res.text[-250:]}")
+        status = _status(res.text)
+        if status == "unknown":
+            detail = " ".join(res.text.split())[:350] or "<empty response>"
+            raise RunnerError(
+                f"Unrecognized Kaggle kernel status for {ref}; cannot safely count running jobs. "
+                f"Kaggle response: {detail}. "
+                f"Inspect with: python -m kaggle kernels status {ref}"
+            )
+        return ref, status, ""
+
+    notify(f"Inspecting Kaggle batch kernels (up to {max_seconds:g}s, {workers} workers).")
     for page in range(1, max_pages + 1):
-        rows = _list_page(cli, page, page_size)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RunnerError(f"Active run check exceeded {max_seconds:g}s; cannot verify free slots. "
+                              "Retry or use `kgr active --max-seconds 120`.")
+        notify(f"Listing notebook page {page}/{max_pages}...")
+        try:
+            rows = _list_page(cli, page, page_size,
+                              timeout_seconds=min(12, max(0.1, remaining)))
+        except RunnerError as exc:
+            raise RunnerError(f"Could not list Kaggle notebooks (page {page}): {exc}") from exc
+        pending: list[tuple[str, dict]] = []
         for row in rows:
             ref = _kernel_ref(row)
             if not ref:
@@ -163,59 +253,89 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5, l
                 continue
             seen.add(ref)
             scanned += 1
-            # The listing can show stale version metadata; always ask Kaggle
-            # for the newest run state, never infer live concurrency from title/date.
-            res = cli.call("kernels", "status", ref, check=False)
-            if res.returncode:
-                if _session_not_found(res.text):
-                    listed_status = _listed_status(row)
-                    if listed_status in ACTIVE:
-                        raise RunnerError(
-                            f"Kaggle reports {ref} as {listed_status} in its notebook list "
-                            "but the live session status is missing; refusing to guess "
-                            "whether a concurrent slot is free"
-                        )
-                    missing_sessions.append({"kernel_ref": ref, "listed_status": listed_status})
-                    continue
-                raise RunnerError(f"Could not verify remote kernel status for {ref}: {res.text[-250:]}")
-            status = _status(res.text)
-            if status == "unknown":
-                # Unknown states must not silently free a concurrent slot. Show
-                # the real response for diagnosis instead of only the kernel ref.
-                detail = " ".join(res.text.split())[:350] or "<empty response>"
-                raise RunnerError(
-                    f"Unrecognized Kaggle kernel status for {ref}; cannot safely count running jobs. "
-                    f"Kaggle response: {detail}. "
-                    f"Inspect with: python -m kaggle kernels status {ref}"
-                )
-            if status in ACTIVE:
-                active.append({"kernel_ref": ref, "status": status})
-            elif status == "new_script":
-                # This is Kaggle's explicit 'no execution started' state, not
-                # an unknown or an in-flight worker.
-                not_started.append({"kernel_ref": ref, "status": status})
+            listed = _listed_status(row)
+            if (not strict and scanned > recent_verify
+                    and listed in {"complete", "error", "cancelled", "failed"}):
+                # Old explicit terminal statuses avoid a redundant status API
+                # roundtrip. Never skip unknown or possibly in-flight states.
+                listed_terminal += 1
+                continue
+            pending.append((ref, row))
+        if pending:
+            notify(f"Page {page}: {len(pending)} notebook statuses to verify, "
+                   f"{listed_terminal} historical terminal entries skipped.")
+
+        for start in range(0, len(pending), batch_size):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RunnerError(f"Active run check exceeded {max_seconds:g}s after {live_checked} "
+                                  "status requests; cannot verify free slots. "
+                                  "Retry or increase --max-seconds.")
+            group = pending[start:start + batch_size]
+            per_call = max(0.1, min(status_timeout_seconds, remaining))
+            # Query only a bounded number of kernels at once to avoid putting
+            # pressure on Kaggle's API or multiplying Python startup latency.
+            with ThreadPoolExecutor(max_workers=min(workers, len(group))) as executor:
+                future_map = {
+                    executor.submit(probe, ref, row, per_call): ref for ref, row in group
+                }
+                try:
+                    for future in as_completed(future_map, timeout=remaining):
+                        ref, status, listed = future.result()
+                        live_checked += 1
+                        if status == "missing":
+                            missing_sessions.append({"kernel_ref": ref, "listed_status": listed})
+                        elif status in ACTIVE:
+                            active.append({"kernel_ref": ref, "status": status})
+                        elif status == "new_script":
+                            not_started.append({"kernel_ref": ref, "status": status})
+                except FuturesTimeout as exc:
+                    for future in future_map:
+                        future.cancel()
+                    raise RunnerError(
+                        f"Active run check exceeded {max_seconds:g}s while querying status; "
+                        "cannot verify free slots. Retry or increase --max-seconds."
+                    ) from exc
+            notify(f"Verified {live_checked} live statuses; {len(active)} active, "
+                   f"{len(missing_sessions)} missing sessions.")
+            if len(active) >= limit:
+                notify("Concurrent limit reached; stopping early without scanning older notebooks.")
+                return snapshot()
         if len(rows) < page_size:
-            return {"running_count": len(active), "max_concurrent": limit,
-                    "has_slot": len(active) < limit, "active": active, "scanned": scanned,
-                    "missing_sessions": missing_sessions,
-                    "missing_session_count": len(missing_sessions),
-                    "not_started": not_started,
-                    "not_started_count": len(not_started),
-                    "note": "Batch kernel snapshots only; historical notebooks with a confirmed missing session are excluded. Interactive sessions may not be included"}
-    raise RunnerError("Kaggle kernel listing exceeded safe pagination window; cannot verify active session count")
+            notify(f"Active scan complete: {len(active)} active out of {scanned} listed.")
+            return snapshot()
+    raise RunnerError(
+        f"Kaggle kernel listing exceeded {max_pages} pages ({scanned} entries); "
+        "cannot verify active session count. Increase pagination support or use --strict "
+        "for diagnostic inspection."
+    )
 
 
 def check_preflight(cli: KaggleCLI, *, gpu: str, required_gpu_hours: float = 0.25,
-                    max_concurrent: int = 2) -> dict:
+                    max_concurrent: int = 2, workers: int = 6,
+                    max_seconds: float = 45, strict: bool = False,
+                    progress: Callable[[str], None] | None = None) -> dict:
     if required_gpu_hours <= 0 or max_concurrent < 1 or max_concurrent > 2:
         raise RunnerError("--required-gpu-hours must be positive and --max-concurrent must be 1 or 2")
-    runs = active_report(cli, limit=max_concurrent)
-    quota = quota_report(cli) if gpu != "cpu" else None
+    runs = active_report(cli, limit=max_concurrent, workers=workers,
+                         max_seconds=max_seconds, strict=strict, progress=progress)
     reasons = []
     if not runs["has_slot"]:
         reasons.append(f"Concurrent batch jobs {runs['running_count']}/{max_concurrent}")
-    if quota is not None and quota["remaining_hours"] < required_gpu_hours:
-        reasons.append(f"GPU remaining {quota['remaining_hours']}h < required {required_gpu_hours}h")
+    quota = None
+    quota_error = None
+    if gpu != "cpu":
+        try:
+            quota = quota_report(cli)
+        except RunnerError as exc:
+            # Keep the confirmed concurrency result visible. Unknown quota is
+            # not permission to submit, even if the account has a free slot.
+            quota_error = str(exc)
+            reasons.append(f"GPU quota unavailable: {quota_error}")
+        else:
+            if quota["remaining_hours"] < required_gpu_hours:
+                reasons.append(f"GPU remaining {quota['remaining_hours']}h < required {required_gpu_hours}h")
     return {"ok": not reasons, "gpu": gpu, "active": runs, "gpu_quota": quota,
+            "gpu_quota_error": quota_error,
             "required_gpu_hours": required_gpu_hours if gpu != "cpu" else 0,
             "reasons": reasons}

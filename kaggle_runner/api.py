@@ -26,7 +26,8 @@ class KaggleCLI:
         self.settings = settings
         self.token = token
 
-    def call(self, *args: str, check: bool = True, stream: bool = False) -> Result:
+    def call(self, *args: str, check: bool = True, stream: bool = False,
+             timeout_seconds: float | None = None) -> Result:
         command = [sys.executable, "-m", "kaggle", *args]
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -39,12 +40,16 @@ class KaggleCLI:
             env["KAGGLE_API_TOKEN"] = self.token
         try:
             if stream:
-                result = subprocess.run(command, env=env, check=False, text=True, encoding="utf-8", errors="replace")
+                result = subprocess.run(command, env=env, check=False, text=True, encoding="utf-8",
+                                        errors="replace", timeout=timeout_seconds)
                 response = Result(command, result.returncode, "", "")
             else:
                 result = subprocess.run(command, env=env, check=False, capture_output=True, text=True,
-                                        encoding="utf-8", errors="replace")
+                                        encoding="utf-8", errors="replace", timeout=timeout_seconds)
                 response = Result(command, result.returncode, result.stdout, result.stderr)
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError(f"Kaggle CLI request timed out after {timeout_seconds:g}s "
+                              f"({' '.join(args[:3])})") from exc
         except FileNotFoundError as exc:
             raise RunnerError(f"Python/Kaggle CLI unavailable: {exc}") from exc
         if self.token:

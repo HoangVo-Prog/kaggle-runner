@@ -52,6 +52,15 @@ class MockAPI:
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
+        # Tests use synthetic credentials. A real runner shell can have
+        # KAGGLE_OWNER/KAGGLE_API_TOKEN exported, which intentionally override
+        # .env values in production but must not leak into these tests.
+        isolated = os.environ.copy()
+        for key in ("KAGGLE_OWNER", "KAGGLE_API_TOKEN", "EMAIL", "KGR_ENV_FILE"):
+            isolated.pop(key, None)
+        sandbox = patch.dict(os.environ, isolated, clear=True)
+        sandbox.start()
+        self.addCleanup(sandbox.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
