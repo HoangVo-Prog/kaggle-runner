@@ -31,6 +31,10 @@ class FakeKaggle:
 
     def call(self, *args, **kwargs):
         self.calls.append(args)
+        if args[:2] == ("kernels", "list"):
+            return Result(list(args), 0, "[]", "")
+        if args[:1] == ("quota",):
+            return Result(list(args), 0, '{"gpu_quota":{"time_used":"3600s","total_time_allowed":"108000s"}}', "")
         if args[:2] == ("kernels", "push"):
             kernel_path = Path(args[args.index("-p") + 1])
             slug = json.loads((kernel_path / "kernel-metadata.json").read_text())["id"].split("/")[1]

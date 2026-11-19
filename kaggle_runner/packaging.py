@@ -16,6 +16,7 @@ import re
 import subprocess
 import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config import RunnerError
 
@@ -32,7 +33,20 @@ ALLOWED_SUFFIXES = {".py", ".toml", ".txt", ".yaml", ".yml", ".json", ".cfg", ".
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
+def _kaggle_web_ref(ref: str, resource: str) -> str:
+    if not ref.startswith(("https://", "http://")):
+        return ref
+    parsed = urlsplit(ref)
+    if parsed.scheme != "https" or parsed.hostname not in {"www.kaggle.com", "kaggle.com"} or parsed.query or parsed.fragment:
+        raise RunnerError(f"Invalid Kaggle {resource} URL")
+    parts = parsed.path.strip("/").split("/")
+    if not parts or parts[0] != resource:
+        raise RunnerError(f"Expected Kaggle /{resource}/... URL")
+    return "/".join(parts[1:])
+
+
 def validate_ref(ref: str, kind: str = "reference") -> str:
+    ref = _kaggle_web_ref(ref, "datasets")
     if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", ref):
         raise RunnerError(f"Invalid {kind}: {ref!r}; expected owner/slug")
     return ref.lower()
@@ -40,6 +54,7 @@ def validate_ref(ref: str, kind: str = "reference") -> str:
 
 def validate_model_ref(ref: str) -> str:
     """A pinned Kaggle Model variation version, not a Model Proxy model ID."""
+    ref = _kaggle_web_ref(ref, "models")
     if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*", ref):
         raise RunnerError(
             f"Invalid model reference: {ref!r}; expected "

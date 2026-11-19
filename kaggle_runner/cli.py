@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 
 from . import __version__
+from .accounts import interactive_init, load_account
+from .preflight import check_preflight, active_report, quota_report
 from .api import KaggleCLI
 from .config import RunnerError, build_settings, load_config
 from .datasets import download_dataset, inspect_local, prepare_dataset, upload_dataset
@@ -23,6 +25,7 @@ def _emit(value: dict | list, *, as_json: bool = True) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kgr", description="Portable Kaggle Python repo runner")
     p.add_argument("--config", help="Optional TOML config (default: XDG_CONFIG_HOME/kaggle-runner/config.toml)")
+    p.add_argument("--env-file", help="Path to private .env for KAGGLE_OWNER, EMAIL, KAGGLE_API_TOKEN")
     p.add_argument("--state-dir", help="Override state directory; paths are resolved on this machine")
     p.add_argument("--profile", help="Saved Kaggle credential alias (isolated per command)")
     p.add_argument("--version", action="version", version=__version__)
@@ -31,12 +34,39 @@ def parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="Check active Python, Kaggle CLI and optional remote authentication")
     d.add_argument("--online", action="store_true", help="Also query your Kaggle kernels (needs login)")
 
-    r = sub.add_parser("run", help="Prepare or push Python repository as a Kaggle script kernel")
-    r.add_argument("--source", required=True, help="Local folder or plain GitHub HTTPS URL")
-    r.add_argument("--entry", required=True, help="Relative Python entrypoint, e.g. train.py")
+    auth = sub.add_parser("auth", help="Configure one Kaggle account using API token")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    init = auth_sub.add_parser("init", help="Interactively create/update private .env")
+    init.add_argument("--owner", help="Kaggle profile username")
+    init.add_argument("--email", help="Report email, metadata only")
+    init.add_argument("--token-stdin", action="store_true", help="Read API token from stdin for CI (not argv)")
+    auth_sub.add_parser("show", help="Show account metadata without revealing token")
+
+    check = sub.add_parser("check", help="Check running batch kernels and GPU quota before submit")
+    check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
+    check.add_argument("--required-gpu-hours", type=float, default=0.25)
+    check.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2)
+    sub.add_parser("quota", help="Check remaining GPU quota")
+    sub.add_parser("active", help="Check running/queued Kaggle batch kernels")
+    report = sub.add_parser("report", help="Summarize local jobs and optionally refresh remote status")
+    report.add_argument("--refresh", action="store_true", help="Query remote statuses")
+    report.add_argument("--limit", type=int, default=100)
+    report.add_argument("--output", help="Write report JSON file")
+    sync = sub.add_parser("sync", help="Refresh all tracked job statuses and print report")
+    sync.add_argument("--limit", type=int, default=100)
+
+    r = sub.add_parser("run", help="Submit a .py/.ipynb file or a Python repository to Kaggle")
+    r.add_argument("file", nargs="?", help="Local .py or .ipynb file (simple workflow)")
+    r.add_argument("--file", dest="file_option", help="Same as positional file")
+    r.add_argument("--source", help="Local folder or plain GitHub HTTPS URL (advanced)")
+    r.add_argument("--entry", help="Relative Python entrypoint, e.g. train.py (advanced)")
     r.add_argument("--owner", help="Your Kaggle username; can be set as [runner].owner in config")
     r.add_argument("--ref", help="Git branch or tag for GitHub HTTPS source")
     r.add_argument("--gpu", choices=("cpu", "t4x2"), default="cpu")
+    r.add_argument("--required-gpu-hours", type=float, default=0.25,
+                   help="Minimum hours needed before GPU submit (default 0.25)")
+    r.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2,
+                   help="Local safety cap on concurrently active batch kernels (default 2)")
     r.add_argument("--dataset", action="append", default=[], metavar="OWNER/SLUG", help="Attach a Kaggle dataset (repeatable; public resources need no download)")
     r.add_argument("--model", action="append", default=[], metavar="OWNER/MODEL/FRAMEWORK/VARIATION/VERSION", help="Attach a pinned Kaggle Model variation version (repeatable)")
     r.add_argument("--unpack-datasets", action="store_true", help="Unzip payload.zip attached datasets into Kaggle working")
@@ -62,6 +92,9 @@ def parser() -> argparse.ArgumentParser:
     f.add_argument("job_id")
     f.add_argument("--output", help="Output folder (default: state/outputs/JOB_ID)")
     f.add_argument("--force", action="store_true", help="Overwrite existing files")
+    f.add_argument("--file-pattern", help="Optional regex to download selected files")
+    files = sub.add_parser("outputs", help="List remote output artifacts for a job")
+    files.add_argument("job_id")
     sub.add_parser("show", help="Print saved job manifest and metadata").add_argument("job_id")
 
     ds = sub.add_parser("dataset", help="Manage local/public/accessible-private Kaggle datasets")
@@ -94,7 +127,31 @@ def parser() -> argparse.ArgumentParser:
 
 def dispatch(a: argparse.Namespace) -> int:
     settings = build_settings(state_dir=a.state_dir, profile=a.profile, config=a.config)
-    cli = KaggleCLI(settings)
+    account = load_account(a.env_file)
+    if a.env_file and a.command != "auth" and not account.token:
+        raise RunnerError("Explicit --env-file has no KAGGLE_API_TOKEN; run `kgr --env-file PATH auth init`")
+    if a.profile and account.token:
+        raise RunnerError("--profile cannot be combined with KAGGLE_API_TOKEN in .env; choose one authentication method")
+    cli = KaggleCLI(settings, token=account.token)
+    if a.command == "auth":
+        if a.auth_command == "init":
+            _emit(interactive_init(a.env_file, a.owner, a.email, a.token_stdin))
+        else:
+            _emit({"owner": account.owner, "email": account.email,
+                   "env_file": str(account.env_file) if account.env_file else None,
+                   "token_configured": bool(account.token)})
+        return 0
+    if a.command in {"check", "quota", "active"}:
+        if a.command == "quota":
+            _emit(quota_report(cli))
+            return 0
+        if a.command == "active":
+            _emit(active_report(cli))
+            return 0
+        result = check_preflight(cli, gpu=a.gpu, required_gpu_hours=a.required_gpu_hours,
+                                 max_concurrent=a.max_concurrent)
+        _emit(result)
+        return 0 if result["ok"] else 3
     if a.command == "doctor":
         check = cli.call("--version", check=False)
         report = {"python": sys.executable, "python_version": sys.version.split()[0],
@@ -151,6 +208,23 @@ def dispatch(a: argparse.Namespace) -> int:
         return 0
     store = JobStore(settings.state)
     if a.command == "run":
+        file = a.file_option or a.file
+        if a.file_option and a.file:
+            raise RunnerError("Pass a single file (positional or --file, not both)")
+        if file and (a.source or a.entry):
+            raise RunnerError("Use either a .py/.ipynb file or --source with --entry")
+        if file:
+            candidate = Path(file).expanduser().resolve()
+            if candidate.suffix.lower() not in {".py", ".ipynb"} or not candidate.is_file():
+                raise RunnerError("File must be an existing .py or .ipynb")
+            source, entry = str(candidate.parent), candidate.name
+            notebook_file = str(candidate) if candidate.suffix.lower() == ".ipynb" else None
+        else:
+            if not a.source or not a.entry:
+                raise RunnerError("Provide a .py/.ipynb file, or both --source and --entry")
+            source, entry, notebook_file = a.source, a.entry, None
+            if entry.endswith(".ipynb"):
+                raise RunnerError("For notebooks use `kgr run ./path/to/notebook.ipynb`")
         if a.fetch and not a.wait:
             raise RunnerError("--fetch requires --wait")
         if (a.wait or a.fetch) and a.dry_run:
@@ -160,13 +234,18 @@ def dispatch(a: argparse.Namespace) -> int:
         if a.output and not a.fetch:
             raise RunnerError("--output requires --fetch")
         config = load_config(a.config)
-        owner = a.owner or config.get("runner", {}).get("owner")
-        result = create_job(settings, cli, store, source=a.source, entry=a.entry, owner=owner,
+        owner = a.owner or account.owner or config.get("runner", {}).get("owner")
+        if not a.dry_run:
+            preflight = check_preflight(cli, gpu=a.gpu, required_gpu_hours=a.required_gpu_hours,
+                                        max_concurrent=a.max_concurrent)
+            if not preflight["ok"]:
+                raise RunnerError("Preflight blocked submission: " + "; ".join(preflight["reasons"]))
+        result = create_job(settings, cli, store, source=source, entry=entry, owner=owner,
                             gpu=a.gpu, dataset_refs=a.dataset, arguments=a.arguments,
                             install_requirements=a.install_requirements, enable_internet=a.enable_internet,
                             max_source_mb=a.max_source_mb, timeout_seconds=a.timeout,
                             dry_run=a.dry_run, git_ref=a.ref, unpack_datasets=a.unpack_datasets,
-                            model_refs=a.model)
+                            model_refs=a.model, notebook_file=notebook_file)
         _emit(result)
         if a.wait:
             job_id = result["job_id"]
@@ -186,6 +265,31 @@ def dispatch(a: argparse.Namespace) -> int:
                 _emit(fetch_job(cli, store, settings.state, job_id, target, force=False))
             if current["status"] != "complete":
                 return 2
+    elif a.command in {"report", "sync"}:
+        if a.limit < 1:
+            raise RunnerError("--limit must be positive")
+        rows = [display_job(j) for j in store.list(a.limit)]
+        for item in rows:
+            if a.command == "sync" or a.refresh:
+                if item["status"] in {"prepared", "submit_failed"}:
+                    continue
+                try:
+                    result = refresh_status(cli, store, item["job_id"])
+                    item["status"] = result["status"]
+                except RunnerError as exc:
+                    item["refresh_error"] = str(exc)
+                    item["status"] = "status_unavailable"
+            item["url"] = "https://www.kaggle.com/code/" + item["kernel_ref"]
+        tally = {}
+        for item in rows:
+            tally[item["status"]] = tally.get(item["status"], 0) + 1
+        report = {"owner": account.owner, "email": account.email,
+                  "total": len(rows), "counts": tally, "jobs": rows}
+        if a.command == "report" and a.output:
+            target = Path(a.output).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        _emit(report)
     elif a.command == "jobs":
         if a.limit < 1:
             raise RunnerError("--limit must be >= 1")
@@ -202,7 +306,15 @@ def dispatch(a: argparse.Namespace) -> int:
             print(result.text)
             store.update(a.job_id, last_message=result.text[-4000:])
     elif a.command == "fetch":
-        _emit(fetch_job(cli, store, settings.state, a.job_id, a.output, force=a.force))
+        _emit(fetch_job(cli, store, settings.state, a.job_id, a.output,
+                        force=a.force, file_pattern=a.file_pattern))
+    elif a.command == "outputs":
+        job = store.get(a.job_id)
+        res = cli.call("kernels", "files", job["kernel_ref"], "--format", "json")
+        try:
+            _emit({"job_id": a.job_id, "files": json.loads(res.stdout)})
+        except json.JSONDecodeError:
+            _emit({"job_id": a.job_id, "raw": res.text})
     elif a.command == "show":
         record = store.get(a.job_id)
         manifest = Path(record["staging_dir"]).parent / "manifest.json"

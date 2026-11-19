@@ -22,8 +22,9 @@ class Result:
 
 
 class KaggleCLI:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, token: str | None = None):
         self.settings = settings
+        self.token = token
 
     def call(self, *args: str, check: bool = True, stream: bool = False) -> Result:
         command = [sys.executable, "-m", "kaggle", *args]
@@ -31,6 +32,11 @@ class KaggleCLI:
         env["PYTHONIOENCODING"] = "utf-8"
         if self.settings.config_dir:
             env["KAGGLE_CONFIG_DIR"] = str(self.settings.config_dir)
+        if self.token:
+            # Isolate token authentication from legacy username/key credentials.
+            env.pop("KAGGLE_USERNAME", None)
+            env.pop("KAGGLE_KEY", None)
+            env["KAGGLE_API_TOKEN"] = self.token
         try:
             if stream:
                 result = subprocess.run(command, env=env, check=False, text=True, encoding="utf-8", errors="replace")
@@ -41,6 +47,10 @@ class KaggleCLI:
                 response = Result(command, result.returncode, result.stdout, result.stderr)
         except FileNotFoundError as exc:
             raise RunnerError(f"Python/Kaggle CLI unavailable: {exc}") from exc
+        if self.token:
+            response = Result(response.args, response.returncode,
+                              response.stdout.replace(self.token, "[REDACTED]"),
+                              response.stderr.replace(self.token, "[REDACTED]"))
         if check and response.returncode != 0:
             raise RunnerError(f"Kaggle CLI exited with {response.returncode}: {response.text or 'see terminal output'}")
         return response
