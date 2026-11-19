@@ -206,7 +206,12 @@ try:
     if project not in entry.parents or not entry.is_file():
         raise ValueError("Entrypoint missing or outside project")
     sys.argv = [str(entry), *_OPTIONS["arguments"]]
-    runpy.run_path(str(entry), run_name="__main__")
+    try:
+        runpy.run_path(str(entry), run_name="__main__")
+    except SystemExit as exc:
+        # Common Python entrypoints use sys.exit(main()). Exit code 0 is success.
+        if exc.code not in (None, 0):
+            raise
     result["status"] = "ok"
 except BaseException as exc:
     result["error"] = repr(exc)

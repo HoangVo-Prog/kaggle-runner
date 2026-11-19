@@ -89,7 +89,9 @@ def dispatch(a: argparse.Namespace) -> int:
             report["kaggle_auth_ok"] = remote.returncode == 0
             report["remote_message"] = remote.text[:1500]
         _emit(report)
-        return 0 if check.returncode == 0 else 1
+        # An online auth check must fail when credentials are not accepted.
+        # Previously doctor --online exited successfully even after auth failure.
+        return 0 if check.returncode == 0 and (not a.online or report.get("kaggle_auth_ok", False)) else 1
     if a.command == "dataset":
         if a.dataset_command == "inspect":
             path = Path(a.source).expanduser()

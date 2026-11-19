@@ -113,6 +113,16 @@ class P0Tests(unittest.TestCase):
                        entry="main.py", owner="x", gpu="cpu", dataset_refs=[], arguments=[])
         self.assertEqual(self.store.list()[0]["status"], "submit_failed")
 
+    def test_status_permission_error_marks_record_and_guides_owner_check(self):
+        live = create_job(self.settings, self.cli, self.store, source=str(self.project),
+                          entry="main.py", owner="my-user", gpu="cpu", dataset_refs=[], arguments=[])
+        class ForbiddenKaggle(FakeKaggle):
+            def call(self, *args, **kwargs):
+                raise RunnerError("Permission 'kernels.get' was denied")
+        with self.assertRaisesRegex(RunnerError, "profile URL"):
+            refresh_status(ForbiddenKaggle(self.settings), self.store, live["job_id"])
+        self.assertEqual(self.store.get(live["job_id"])["status"], "status_unavailable")
+
     def test_dataset_manager_keeps_nested_data_and_private(self):
         ds = self.root / "dataset"
         (ds / "data" / "deep").mkdir(parents=True)

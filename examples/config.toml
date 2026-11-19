@@ -3,6 +3,6 @@
 # Windows: %APPDATA%/kaggle-runner/config.toml
 # Or use: kgr --config /any/path/config.toml ...
 [runner]
-owner = "YOUR_KAGGLE_USERNAME"
+owner = "hoang_vo"
 # profile = "primary"          # optional: uses ~/.kaggle-profiles/primary
 # state_dir = "/custom/state"  # optional: OS-specific, never checked into shared repo

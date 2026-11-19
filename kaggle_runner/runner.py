@@ -18,8 +18,10 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                install_requirements: bool = False, enable_internet: bool = False,
                max_source_mb: int = 3, timeout_seconds: int = 0, dry_run: bool = False,
                git_ref: str | None = None, unpack_datasets: bool = False) -> dict:
-    if not owner or not owner.replace("-", "").replace("_", "").isalnum():
-        raise RunnerError("--owner must be a Kaggle username (alphanumeric, dash, underscore)")
+    if not owner:
+        raise RunnerError("Kaggle username is not configured. Pass --owner with the username from your Kaggle profile URL, or set [runner].owner in config.toml (not your display name).")
+    if not owner.replace("-", "").replace("_", "").isalnum():
+        raise RunnerError("--owner must be your Kaggle profile URL username (alphanumeric, dash, underscore), not display name")
     if max_source_mb < 1 or max_source_mb > 25:
         raise RunnerError("--max-source-mb must be in [1,25]")
     if timeout_seconds < 0:
@@ -88,7 +90,21 @@ def parse_kernel_status(output: str) -> str:
 
 def refresh_status(cli: KaggleCLI, store: JobStore, job_id: str) -> dict:
     record = store.get(job_id)
-    result = cli.call("kernels", "status", record["kernel_ref"])
+    try:
+        result = cli.call("kernels", "status", record["kernel_ref"])
+    except RunnerError as exc:
+        detail = str(exc)
+        store.update(job_id, status="status_unavailable", last_message=detail[-4000:])
+        if "kernels.get" in detail or "Cannot access kernel" in detail:
+            raise RunnerError(
+                f"Cannot read remote kernel {record['kernel_ref']!r} (local job {job_id}). "
+                "Verify that --owner matches the username in the authenticated Kaggle account's "
+                "profile URL, and check `python -m kaggle kernels list --mine`. "
+                "Also inspect the original submit_output (if available): a locally generated "
+                "job ID does not confirm a Kaggle notebook exists. "
+                f"Kaggle error: {detail}"
+            ) from exc
+        raise
     status = parse_kernel_status(result.text)
     store.update(job_id, status=status, last_message=result.text[-4000:])
     return {"job_id": job_id, "kernel_ref": record["kernel_ref"],

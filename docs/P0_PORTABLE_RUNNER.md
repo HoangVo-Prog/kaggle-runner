@@ -140,3 +140,11 @@ Official references:
 - https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md
 - https://github.com/Kaggle/kaggle-cli/blob/main/docs/datasets.md
 - https://github.com/Kaggle/kaggle-cli/blob/main/docs/datasets_metadata.md
+
+## Quick GPU smoke example
+
+After installing the CLI and authenticating with `python -m kaggle auth login`,
+see [`examples/gpu-smoke-test/README.md`](../examples/gpu-smoke-test/README.md)
+for a one-command `run_example.py` workflow that submits a T4 ×2 probe,
+monitors status, and automatically downloads JSON, CSV and log artifacts.
+The example uses relative paths and the `KGR_OUTPUT_DIR` environment variable.
