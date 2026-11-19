@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from contextvars import ContextVar
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -16,10 +18,18 @@ from .datasets import download_dataset, inspect_local, prepare_dataset, upload_d
 from .jobs import JobStore, display_job
 from .packaging import validate_ref, validate_model_ref
 from .runner import create_job, fetch_job, refresh_status
+from .presentation import format_output
 
 
-def _emit(value: dict | list, *, as_json: bool = True) -> None:
-    print(json.dumps(value, indent=2, ensure_ascii=False, default=str), flush=True)
+_JSON_OUTPUT: ContextVar[bool] = ContextVar("kgr_json_output", default=False)
+_COMMAND: ContextVar[str] = ContextVar("kgr_command", default="")
+
+
+def _emit(value: dict | list, *, as_json: bool | None = None) -> None:
+    machine = _JSON_OUTPUT.get() if as_json is None else as_json
+    output = (json.dumps(value, indent=2, ensure_ascii=False, default=str)
+              if machine else format_output(value, _COMMAND.get()))
+    print(output, flush=True)
 
 
 def _progress(message: str) -> None:
@@ -33,6 +43,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--state-dir", help="Override state directory; paths are resolved on this machine")
     p.add_argument("--profile", help="Saved Kaggle credential alias (isolated per command)")
     p.add_argument("--version", action="version", version=__version__)
+    p.add_argument("--json", action="store_true", help="Full machine-readable JSON (also accepted after commands)")
     sub = p.add_subparsers(dest="command", required=True)
 
     d = sub.add_parser("doctor", help="Check active Python, Kaggle CLI and optional remote authentication")
@@ -116,6 +127,15 @@ def parser() -> argparse.ArgumentParser:
     files = sub.add_parser("outputs", help="List remote output artifacts for a job")
     files.add_argument("job_id")
     sub.add_parser("show", help="Print saved job manifest and metadata").add_argument("job_id")
+    repair = sub.add_parser("repair", help="Correct the Kaggle owner/ref of a tracked job")
+    repair.add_argument("job_id", help="Full Job ID or unique prefix (8+ characters)")
+    corrected = repair.add_mutually_exclusive_group(required=True)
+    corrected.add_argument("--owner", help="Correct username; keeps existing notebook slug")
+    corrected.add_argument("--kernel-ref", help="Canonical owner/slug from Kaggle notebook URL")
+    archive = sub.add_parser("archive", help="Exclude a confirmed inactive historical job from slot checks")
+    archive.add_argument("job_id", help="Full Job ID or unique prefix (8+ characters)")
+    archive.add_argument("--confirm-inactive", action="store_true",
+                         help="You checked Kaggle Active Events and confirm the run is inactive")
 
     ds = sub.add_parser("dataset", help="Manage local/public/accessible-private Kaggle datasets")
     ds_sub = ds.add_subparsers(dest="dataset_command", required=True)
@@ -142,6 +162,17 @@ def parser() -> argparse.ArgumentParser:
     m_search.add_argument("query", help="Search phrase")
     m_files = models_sub.add_parser("files", help="List files in a pinned model version")
     m_files.add_argument("ref", help="owner/model/framework/variation/version")
+    # Accept both `kgr --json check` and `kgr check --json`, including nested
+    # subcommands. SUPPRESS preserves the parent value when the child omits it.
+    def child_json_flags(parser: argparse.ArgumentParser) -> None:
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    child.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                                       help="Full machine-readable JSON")
+                    child_json_flags(child)
+
+    child_json_flags(p)
     return p
 
 
@@ -166,7 +197,8 @@ def dispatch(a: argparse.Namespace) -> int:
             _emit(quota_report(cli))
             return 0
         scan_kwargs = {"workers": a.workers, "max_seconds": a.max_seconds,
-                       "strict": a.strict, "progress": None if a.quiet else _progress}
+                       "strict": a.strict,
+                       "progress": _progress if not a.quiet and (a.remote or a.strict) else None}
         store = JobStore(settings.state)
         if a.command == "active":
             if a.remote or a.strict:
@@ -269,7 +301,8 @@ def dispatch(a: argparse.Namespace) -> int:
                                         max_concurrent=a.max_concurrent, store=store,
                                         owner=owner, remote=a.remote,
                                         workers=a.workers, max_seconds=a.max_seconds,
-                                        strict=a.strict, progress=None if a.quiet else _progress)
+                                        strict=a.strict,
+                                        progress=_progress if not a.quiet and (a.remote or a.strict) else None)
             if not preflight["ok"]:
                 raise RunnerError("Preflight blocked submission: " + "; ".join(preflight["reasons"]))
         result = create_job(settings, cli, store, source=source, entry=entry, owner=owner,
@@ -347,6 +380,29 @@ def dispatch(a: argparse.Namespace) -> int:
             _emit({"job_id": a.job_id, "files": json.loads(res.stdout)})
         except json.JSONDecodeError:
             _emit({"job_id": a.job_id, "raw": res.text})
+    elif a.command == "repair":
+        record = store.get(a.job_id)
+        slug = record["kernel_ref"].split("/", 1)[-1]
+        if a.owner:
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", a.owner):
+                raise RunnerError("Invalid Kaggle owner")
+            new_ref = f"{a.owner}/{slug}"
+        else:
+            new_ref = validate_ref(a.kernel_ref, "kernel ref")
+            if new_ref.split("/", 1)[1] != slug:
+                raise RunnerError("Kernel slug differs from original; refusing to retarget a different notebook")
+        store.set_kernel_ref(record["job_id"], new_ref)
+        _emit({"job_id": record["job_id"], "kernel_ref": new_ref,
+               "status": "ref_corrected", "note": "Local correction; remote status not verified"})
+    elif a.command == "archive":
+        if not a.confirm_inactive:
+            raise RunnerError("Archive requires --confirm-inactive after checking Kaggle Active Events. "
+                              "This does NOT stop a remote job.")
+        record = store.get(a.job_id)
+        store.update(record["job_id"], status="archived",
+                     last_message="Manually confirmed inactive and archived locally")
+        _emit({"job_id": record["job_id"], "kernel_ref": record["kernel_ref"],
+               "status": "archived", "note": "Excluded from local preflight; remote job unchanged"})
     elif a.command == "show":
         record = store.get(a.job_id)
         manifest = Path(record["staging_dir"]).parent / "manifest.json"
@@ -359,7 +415,14 @@ def dispatch(a: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = parser()
     try:
-        return dispatch(p.parse_args(argv))
+        args = p.parse_args(argv)
+        json_token = _JSON_OUTPUT.set(bool(args.json))
+        command_token = _COMMAND.set(args.command or "")
+        try:
+            return dispatch(args)
+        finally:
+            _JSON_OUTPUT.reset(json_token)
+            _COMMAND.reset(command_token)
     except RunnerError as exc:
         print(f"kgr: {exc}", file=sys.stderr)
         return 2

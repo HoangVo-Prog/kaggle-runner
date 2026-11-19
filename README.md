@@ -24,17 +24,76 @@ kgr --env-file .env auth show
 
 The `.env` content is simply `KAGGLE_OWNER=...`, `EMAIL=...`, `KAGGLE_API_TOKEN=...`; see [`.env.example`](.env.example) for placeholders. It is ignored by Git. `KGR_ENV_FILE=/path/to/.env` or `--env-file` selects a credential file for your own account. The environment variables themselves can be used instead (e.g. CI secret injection). **Never pass the token on the command line or include it in notebook code.**
 
+## Compact CLI output and slot-limit regression tests
+
+Commands show short summaries by default; append `--json` whenever a script
+needs the full machine-readable payload:
+
+```bash
+kgr quota
+kgr active
+kgr check --gpu t4x2 --required-gpu-hours 2
+kgr jobs
+kgr report --refresh
+kgr check --gpu t4x2 --required-gpu-hours 2 --json
+```
+
+**CPU and GPU share the same two-job local safety cap.** Keep a separate
+`--state-dir` per account if using multiple authorized environments. The
+local safety check counts all unfinished jobs in that ledger, not just jobs
+matching the optional `KAGGLE_OWNER` report label.
+ To verify the exact
+"GPU job + CPU job, then block the third job" sequence **without using GPU
+quota**:
+
+```bash
+python -m unittest discover -s tests -p 'test_slot_scenarios.py' -v
+```
+
+See [real-Kaggle slot-test walkthrough](examples/slot-limit-test/README.md)
+for the optional live version (it consumes Kaggle quota) and
+[CLI output details](docs/CLI_OUTPUT.md) for the display/JSON contract.
+
 ## 1. Check before running
 
 ```bash
 kgr quota                         # Remaining GPU hours
-kgr active                        # Running/queued Kaggle batch kernels
+kgr active                        # Running/queued Kaggle batch kernels; progress on stderr
 kgr check --gpu t4x2 --required-gpu-hours 1.5
 ```
+
+`kgr quota` is a direct **account-level** API request: it does not list notebooks.
+`kgr active` checks visible batch-kernel sessions and may list/probe notebooks because
+this is a separate concurrency check. `kgr check` combines both results. If the
+account reaches the configured concurrency threshold, `check` reports that
+blocker even when quota cannot be parsed; unverified quota is never treated as
+available.
 
 `kgr run` performs the same preflight automatically. The default local safety ceiling is **2 active batch kernels** and the minimum expected GPU budget is **0.25 hours** (adjust using `--required-gpu-hours`). A job is **blocked** if the running count reaches the ceiling, if GPU quota is insufficient, or if the API response cannot be verified. CPU jobs check active batch kernels, but not GPU hours.
 
 **Important:** Kaggle can enforce different resource limits, reserve GPU time, and run interactive sessions that the kernels listing does not enumerate. These checks are conservative estimates, **not** a guarantee of availability or a claim that Kaggle globally allows exactly two sessions. A GPU allocation still depends on Kaggle.
+
+`kgr active` prints scan progress immediately to stderr, probes kernel statuses in
+bounded parallel batches, stops early when the concurrent limit is reached, and
+applies a default **45-second scan budget**. This avoids waiting silently while
+hundreds of historical notebooks are examined. JSON output remains on stdout:
+
+```bash
+kgr active                             # Progress + JSON result
+kgr active --quiet                     # JSON only (for scripts)
+kgr active --workers 4 --max-seconds 90  # More time for slow connections
+kgr active --strict                    # Recheck ALL entries; slower
+kgr check --gpu t4x2 --required-gpu-hours 2
+```
+
+In default mode, the newest 20 notebook entries are always verified live, as are
+entries marked active/unknown. For older entries explicitly marked terminal by
+Kaggle's sorted listing, the CLI can use that terminal snapshot without a separate
+status request. The JSON report includes `live_checked_count` and
+`listed_terminal_count` to distinguish these sources. `--strict` disables this
+shortcut. If the time budget expires or an unknown status is encountered, preflight
+**blocks submit** rather than guessing available capacity. These status checks
+cannot reserve a slot or guarantee visibility of interactive sessions.
 
 `kgr active` recognizes Kaggle worker states including `NEW_SCRIPT` (not started), `CANCEL_REQUESTED` and `CANCEL_ACKNOWLEDGED` (both conservatively count as occupied until confirmed finished). A notebook with a confirmed missing historical session is reported separately. If Kaggle introduces an unknown status, preflight **stops** and prints the original status response; diagnose with `python -m kaggle kernels status OWNER/SLUG`. Never assume an unknown state is a free slot.
 

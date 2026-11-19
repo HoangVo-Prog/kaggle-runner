@@ -9,8 +9,10 @@ import csv
 import io
 import json
 import re
+from pathlib import Path
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .api import KaggleCLI
@@ -25,7 +27,7 @@ ACTIVE = {"running", "queued", "pending", "initializing", "starting",
 # Cancellation acknowledgement can persist in the historical kernel status after
 # Kaggle Active Events has no running session. It is not proof of a live slot.
 CANCELLING = {"cancel_acknowledged"}
-LOCAL_CANDIDATES = ACTIVE | CANCELLING | {"submitted", "status_unavailable", "unknown"}
+LOCAL_CANDIDATES = ACTIVE | CANCELLING | {"submitted", "status_unavailable", "unknown", "new_script"}
 TERMINAL = {"complete", "error", "cancelled", "failed", "new_script"}
 
 
@@ -321,6 +323,37 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
     )
 
 
+def _ref_candidates(record: dict, owner: str | None) -> list[str]:
+    """Possible corrected refs from explicit account metadata or stored push URLs.
+
+    Never treat a candidate as valid until Kaggle confirms its status.
+    The notebook slug must match the original one exactly.
+    """
+    ref = record["kernel_ref"]
+    if "/" not in ref:
+        return []
+    original_owner, slug = ref.split("/", 1)
+    possible: list[str] = []
+    if owner and re.fullmatch(r"[a-zA-Z0-9_-]+", owner) and owner.lower() != original_owner.lower():
+        possible.append(f"{owner}/{slug}")
+    texts = [record.get("last_message") or ""]
+    path = Path(record["staging_dir"]).parent / "manifest.json"
+    if path.is_file():
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            if manifest.get("job_id") == record["job_id"]:
+                texts += [manifest.get("submit_output") or "", manifest.get("kernel_ref") or ""]
+        except (OSError, ValueError, TypeError):
+            pass
+    for value in texts:
+        for match in re.finditer(r"https?://(?:www\.)?kaggle\.com/code/([a-zA-Z0-9_-]+)/([a-zA-Z0-9_-]+)", value):
+            if match.group(2) == slug:
+                possible.append(f"{match.group(1)}/{slug}")
+        if value.count("/") == 1 and value.endswith("/" + slug):
+            possible.append(value)
+    return list(dict.fromkeys(candidate for candidate in possible if candidate != ref))
+
+
 def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None = None,
                           limit: int = 2, workers: int = 6, max_seconds: float = 45,
                           progress: Callable[[str], None] | None = None) -> dict:
@@ -336,9 +369,9 @@ def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None 
     records = store.list(10001)
     if len(records) > 10000:
         raise RunnerError("Local ledger exceeds safe inspection limit; archive old jobs first")
-    candidates = [r for r in records
-                  if r["status"] in LOCAL_CANDIDATES
-                  and (not owner or r["kernel_ref"].split("/", 1)[0].lower() == owner.lower())]
+    # Never filter local jobs by owner metadata: Kaggle can return a different
+    # canonical owner during submit, and mixed CPU/GPU runs share one cap.
+    candidates = [r for r in records if r["status"] in LOCAL_CANDIDATES]
     if len(candidates) > 50:
         raise RunnerError("More than 50 local jobs need verification; use `kgr sync` to refresh old records")
     running: list[dict] = []
@@ -346,26 +379,38 @@ def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None 
     missing: list[dict] = []
     not_started: list[dict] = []
     checked = 0
+    unverified: list[dict] = []
     deadline = time.monotonic() + max_seconds
     if progress:
         progress(f"Checking {len(candidates)} runner-tracked jobs (no notebook listing).")
 
-    def probe(record: dict, seconds: float) -> tuple[dict, str]:
+    def probe(record: dict, seconds: float) -> tuple[dict, str, str, str | None]:
         ref = record["kernel_ref"]
-        try:
-            result = cli.call("kernels", "status", ref, check=False,
-                              timeout_seconds=seconds)
-        except RunnerError as exc:
-            raise RunnerError(f"Could not verify tracked job {ref}: {exc}") from exc
-        if result.returncode:
-            if _session_not_found(result.text):
-                return record, "missing"
-            raise RunnerError(f"Could not verify tracked job {ref}: {result.text[-300:]}")
-        state = _status(result.text)
-        if state == "unknown":
-            raise RunnerError(f"Unrecognized status for tracked job {ref}: "
-                              f"{' '.join(result.text.split())[:300]}")
-        return record, state
+        refs = [ref, *_ref_candidates(record, owner)]
+        errors: list[str] = []
+        for index, candidate in enumerate(refs):
+            try:
+                result = cli.call("kernels", "status", candidate, check=False,
+                                  timeout_seconds=seconds)
+            except RunnerError as exc:
+                errors.append(str(exc))
+                continue
+            if result.returncode:
+                errors.append(result.text)
+                continue
+            state = _status(result.text)
+            if state == "unknown":
+                errors.append("unrecognized status")
+                continue
+            return record, state, candidate, None
+        # A definite missing session with no other permission error is not an
+        # active job. Permission errors remain uncertain and block preflight.
+        if errors and all(_session_not_found(error) for error in errors):
+            return record, "missing", ref, None
+        # Do not print verbose Kaggle SDK advice in interactive CLI output.
+        kind = "access_denied" if any(re.search(r"denied|forbidden|permission|\b403\b", e, re.I)
+                                          for e in errors) else "unverified"
+        return record, "unverified", ref, kind
 
     # At most `workers` concurrent subprocesses, and each has its own timeout.
     # Very large local histories are explicitly rejected above rather than
@@ -379,14 +424,31 @@ def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None 
             futures = [executor.submit(probe, rec, min(8, max(0.1, remaining))) for rec in group]
             try:
                 for future in as_completed(futures, timeout=remaining):
-                    record, state = future.result()
+                    record, state, ref, issue = future.result()
                     checked += 1
-                    ref = record["kernel_ref"]
+                    if ref != record["kernel_ref"] and state not in {"missing", "unverified"}:
+                        store.set_kernel_ref(record["job_id"], ref)
                     if state == "missing":
                         missing.append({"kernel_ref": ref, "job_id": record["job_id"]})
-                        store.update(record["job_id"], status="status_unavailable",
-                                     last_message="Remote session not found during fast preflight")
+                        store.update(record["job_id"], status="missing_session",
+                                     last_message="Remote kernel session no longer exists")
+                    elif state == "unverified":
+                        unverified.append({"kernel_ref": ref, "job_id": record["job_id"],
+                                           "reason": issue})
+                        store.update(record["job_id"], status="status_unavailable")
                     else:
+                        # Immediately after a successful push, Kaggle may still
+                        # report NEW_SCRIPT before the queued worker is visible.
+                        # Hold a brief local reservation to avoid accepting a
+                        # third submission during that propagation window.
+                        if state == "new_script":
+                            try:
+                                age = (datetime.now(timezone.utc) -
+                                       datetime.fromisoformat(record["created_at"])).total_seconds()
+                            except (ValueError, TypeError):
+                                age = 0  # Invalid timestamp: conservative
+                            if age < 120:
+                                state = "pending"
                         store.update(record["job_id"], status=state)
                         item = {"kernel_ref": ref, "job_id": record["job_id"], "status": state}
                         if state in ACTIVE:
@@ -402,7 +464,8 @@ def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None 
         if len(running) >= limit:
             break
     return {"running_count": len(running), "max_concurrent": limit,
-            "has_slot": len(running) < limit, "active": running,
+            "has_slot": len(running) < limit and not unverified, "active": running,
+            "unverified": unverified, "unverified_count": len(unverified),
             "cancelling": cancelling, "cancelling_count": len(cancelling),
             "missing_sessions": missing, "missing_session_count": len(missing),
             "not_started": not_started, "not_started_count": len(not_started),
@@ -436,8 +499,12 @@ def check_preflight(cli: KaggleCLI, *, gpu: str, required_gpu_hours: float = 0.2
                                      limit=max_concurrent, workers=workers,
                                      max_seconds=max_seconds, progress=progress)
     reasons: list[str] = []
-    if not runs["has_slot"]:
+    if runs["running_count"] >= max_concurrent:
         reasons.append(f"Concurrent batch jobs {runs['running_count']}/{max_concurrent}")
+    if runs.get("unverified_count"):
+        reasons.append(f"{runs['unverified_count']} historical job(s) need attention; "
+                       "use `kgr repair JOB_ID --owner CORRECT_OWNER` or "
+                       "`kgr archive JOB_ID --confirm-inactive`")
     quota = None
     quota_error = None
     if gpu != "cpu":

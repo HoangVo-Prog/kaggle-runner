@@ -100,7 +100,7 @@ class WorkflowTests(unittest.TestCase):
         with redirect_stdout(out):
             self.assertEqual(main(["--env-file", str(self.env), "auth", "show"]), 0)
         self.assertNotIn("not-a-real-token", out.getvalue())
-        self.assertIn('"token_configured": true', out.getvalue())
+        self.assertIn('token_configured: True', out.getvalue())
         self.assertRaises(RunnerError, write_account, str(self.env), "bad name", "person@example.org", "x")
 
     def test_token_is_only_passed_to_subprocess_not_command(self):
@@ -210,7 +210,7 @@ class WorkflowTests(unittest.TestCase):
         out = StringIO()
         argv = ["--env-file", str(self.env), "--state-dir", str(self.settings.state), "run",
                 str(notebook), "--gpu", "t4x2", "--dataset", "uciml/iris",
-                "--model", "google/mobilenet-v2/tensorFlow2/130-224-classification/1", "--dry-run"]
+                "--model", "google/mobilenet-v2/tensorFlow2/130-224-classification/1", "--dry-run", "--json"]
         with redirect_stdout(out):
             self.assertEqual(main(argv), 0)
         job = json.loads(out.getvalue())
@@ -227,7 +227,7 @@ class WorkflowTests(unittest.TestCase):
         nb = self.root / "test.ipynb"
         nb.write_text(json.dumps({"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[]}))
         args = ["--env-file", str(self.env), "--state-dir", str(self.settings.state),
-                "run", str(nb), "--gpu", "cpu"]
+                "run", str(nb), "--gpu", "cpu", "--json"]
         with patch.object(KaggleCLI, "call", self.api.call), redirect_stdout(StringIO()) as output:
             self.assertEqual(main(args), 0)
         result = json.loads(output.getvalue())
@@ -242,7 +242,7 @@ class WorkflowTests(unittest.TestCase):
         src.write_text("print('submitted')")
         self.api.running = ["test/run-a", "test/run-b"]
         args = ["--env-file", str(self.env), "--state-dir", str(self.settings.state),
-                "run", str(src), "--gpu", "t4x2", "--required-gpu-hours", "1.5", "--remote"]
+                "run", str(src), "--gpu", "t4x2", "--required-gpu-hours", "1.5", "--remote", "--json"]
         with patch.object(KaggleCLI, "call", self.api.call), redirect_stdout(StringIO()):
             self.assertEqual(main(args), 2)
         self.assertFalse(any(c[:2] == ("kernels", "push") for c in self.api.calls))

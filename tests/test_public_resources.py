@@ -133,7 +133,8 @@ class PublicResourcesTests(unittest.TestCase):
         self.assertEqual(record["status"], "complete")
         self.assertEqual(json.loads((output / record["job_id"] / "test_result.json").read_text()), {"ok": True})
         self.assertEqual(json.loads((Path(record["staging_dir"]).parent / "manifest.json").read_text())["kernel_ref"], record["kernel_ref"])
-        self.assertIn('"status": "complete"', out.getvalue())
+        self.assertIn("Job ", out.getvalue())
+        self.assertIn(": complete", out.getvalue())
 
     def test_public_discovery_commands_use_kaggle_cli(self):
         from kaggle_runner.api import KaggleCLI

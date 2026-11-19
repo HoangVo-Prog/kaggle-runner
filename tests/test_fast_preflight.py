@@ -106,11 +106,12 @@ class FastPreflightTests(unittest.TestCase):
         self.assertEqual(report["active"]["running_count"], 2)
         self.assertTrue(any("Concurrent batch jobs 2/2" in r for r in report["reasons"]))
 
-    def test_other_owner_jobs_not_counted_in_local_preflight(self):
+    def test_other_owner_jobs_still_count_in_shared_local_ledger(self):
         self.add_job("otheruser/a", "foreign")
         report = tracked_active_report(self.api, self.store, owner="hoanggvo")
-        self.assertEqual(report["scanned"], 0)
-        self.assertFalse(self.api.calls)
+        self.assertEqual(report["scanned"], 1)
+        self.assertEqual(report["running_count"], 1)
+        self.assertTrue(any(c[:2] == ("kernels", "status") for c in self.api.calls))
 
     def test_quota_shortage_still_blocks_and_uncertain_remote_status_fails(self):
         self.api.quota = 0.5
@@ -120,8 +121,9 @@ class FastPreflightTests(unittest.TestCase):
         self.assertIn("GPU remaining", " ".join(report["reasons"]))
         self.add_job("hoanggvo/new", "new1")
         self.api.raise_status = True
-        with self.assertRaisesRegex(RunnerError, "Could not verify tracked job"):
-            tracked_active_report(self.api, self.store, owner="hoanggvo")
+        report = tracked_active_report(self.api, self.store, owner="hoanggvo")
+        self.assertEqual(report["unverified_count"], 1)
+        self.assertFalse(report["has_slot"])
 
     def test_cli_active_defaults_to_local_and_remote_opt_in(self):
         from kaggle_runner.accounts import write_account
@@ -131,11 +133,11 @@ class FastPreflightTests(unittest.TestCase):
         api.statuses = {"hoanggvo/ta-en-ablation": "CANCEL_ACKNOWLEDGED"}
         argv = ["--env-file", str(env), "--state-dir", str(self.root / "state")]
         with patch.object(KaggleCLI, "call", api.call), redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()):
-            self.assertEqual(main([*argv, "active"]), 0)
+            self.assertEqual(main([*argv, "active", "--json"]), 0)
         self.assertEqual(json.loads(out.getvalue())["source"], "tracked_jobs")
         self.assertEqual(api.calls, [])
         with patch.object(KaggleCLI, "call", api.call), redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()):
-            self.assertEqual(main([*argv, "active", "--remote"]), 0)
+            self.assertEqual(main([*argv, "active", "--remote", "--json"]), 0)
         self.assertEqual(json.loads(out.getvalue())["cancelling_count"], 1)
         self.assertTrue(any(c[:2] == ("kernels", "list") for c in api.calls))
 
@@ -146,7 +148,7 @@ class FastPreflightTests(unittest.TestCase):
         src = self.root / "train.py"
         src.write_text('print("test")\n')
         argv = ["--env-file", str(env), "--state-dir", str(self.root / "state"),
-                "run", str(src), "--gpu", "t4x2", "--required-gpu-hours", "2"]
+                "run", str(src), "--gpu", "t4x2", "--required-gpu-hours", "2", "--json"]
         with patch.object(KaggleCLI, "call", self.api.call), \
              redirect_stdout(StringIO()) as out, redirect_stderr(StringIO()):
             self.assertEqual(main(argv), 0)

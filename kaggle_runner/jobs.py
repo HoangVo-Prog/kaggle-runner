@@ -68,9 +68,35 @@ class JobStore:
     def get(self, job_id: str) -> dict:
         with self._connect() as con:
             row = con.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None and len(job_id) >= 8 and all(c in "0123456789abcdef" for c in job_id.lower()):
+            with self._connect() as con:
+                matches = con.execute("SELECT * FROM jobs WHERE job_id LIKE ? LIMIT 2", (job_id + "%",)).fetchall()
+            if len(matches) > 1:
+                raise RunnerError(f"Ambiguous job ID prefix {job_id}; use a longer ID")
+            if matches:
+                row = matches[0]
         if row is None:
             raise RunnerError(f"Unknown job ID {job_id}. Use `kgr jobs` to list jobs.")
         return dict(row)
+
+    def set_kernel_ref(self, job_id: str, kernel_ref: str) -> None:
+        """Correct a historical ref; keep the original job, ID and artifacts."""
+        record = self.get(job_id)
+        if record["kernel_ref"] == kernel_ref:
+            return
+        self.update(record["job_id"], kernel_ref=kernel_ref)
+        manifest_path = Path(record["staging_dir"]).parent / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest.get("job_id") != record["job_id"]:
+                    return
+                manifest["kernel_ref"] = kernel_ref
+                manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            except (OSError, ValueError, TypeError):
+                # The SQLite ledger is authoritative; some legacy staging folders
+                # were already deleted and must not block a ref correction.
+                pass
 
     def list(self, limit: int = 30) -> list[dict]:
         with self._connect() as con:
