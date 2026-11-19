@@ -1,61 +1,142 @@
-# Team API profiles
+# Team Kaggle profiles: one private `.env`
 
-`kgr` can manage **explicitly authorized** Kaggle API tokens for different team members. Each profile is a local credential file; **never commit or share it**. Everyone should authorize the machine where their token will be used, and follow Kaggle's account policies.
+The `.env` file is the **single source of truth** for team API credentials and
+account metadata. `config.toml` is **not** used for team accounts. All users must
+have authorized the use of their own Kaggle token on this runner machine.
 
-## Add an account
+## 1. Configure the team
 
-```bash
-kgr team add alice --username alice-kaggle --email alice@lab.example
-kgr team add bob --username bob-kaggle
+Use **`<repository-root>/.env`** (beside `pyproject.toml`) as the default
+credential file. On Linux/WSL use `chmod 600 .env`. The project-root file
+contains only *locally authorized* credentials; **never commit, upload or share it**.
+The fields `USERNAME` and `API_TOKEN` are required for each account; `EMAIL` is
+optional report metadata and never used for authentication.
+
+```dotenv
+# Optional legacy default account (independent of team profiles)
+KAGGLE_OWNER=default_user
+EMAIL=default@example.org
+KAGGLE_API_TOKEN=default-token
+
+# All team accounts live in this one file:
+KGR_TEAM_PROFILES=alice,bob
+KGR_TEAM_ALICE_USERNAME=alice_kaggle
+KGR_TEAM_ALICE_API_TOKEN=alice-token
+KGR_TEAM_ALICE_EMAIL=alice@example.org
+KGR_TEAM_BOB_USERNAME=bob_kaggle
+KGR_TEAM_BOB_API_TOKEN=bob-token
+# KGR_TEAM_BOB_EMAIL is optional
 ```
 
-The prompt reads the API token with input hidden. Both `--username` and the token are **required**; `--email` is optional and report-only. The username creates the `owner/slug` notebook reference and labels the report; the API token is the **only credential** passed to Kaggle. A mismatched username/token will be rejected by Kaggle.
+Values above are **placeholders**, not working tokens. Aliases are case-insensitive
+and may use letters, numbers, `_` and `-`. For aliases containing a dash, the
+corresponding variable prefix uses `_`; `lab-a` is `KGR_TEAM_LAB_A_`. Do not
+use both `lab-a` and `lab_a` (same variable namespace). The comma-separated
+`KGR_TEAM_PROFILES` declares the enabled profiles; `team add` maintains it.
 
-For CI, read from standard input instead of a command argument (avoid shell history):
-
-```bash
-# Example: supply the token through a secret provider, not a literal shell value.
-secret_provider_command | kgr team add alice --username alice-kaggle --token-stdin
-```
-
-Profiles live under `~/.config/kaggle-runner/team/*.env` on Linux/WSL by default, with restrictive file permissions (`0600`, directory `0700`). `KGR_TEAM_DIR` optionally overrides that location. **Keep the credential directory outside Git.** `kgr team add` rejects replacing an existing profile without `--replace`, as well as duplicate usernames under different aliases.
-
-## Check and schedule jobs
+Create the repository-root `.env` automatically with the CLI (it uses
+private `0600` permissions on POSIX):
 
 ```bash
+cd /path/to/kaggle-runner
+kgr team add alice --username alice_kaggle
+kgr team add bob --username bob_kaggle --email bob@example.org
 kgr team list
-kgr team check --gpu t4x2 --required-gpu-hours 2
-
-# Choose a particular member's credentials
-kgr run ./train.py --gpu t4x2 --account alice
-
-# Automatically select a locally authorized profile with capacity and enough GPU hours
-kgr run ./train.ipynb --gpu t4x2 --required-gpu-hours 2 --account auto \
-  --dataset uciml/iris \
-  --model google/mobilenet-v2/tensorFlow2/130-224-classification/1
+# ls -l .env
 ```
 
-`--account auto` checks each profile's **runner-tracked** concurrent CPU + GPU jobs and its independent GPU quota. Selection prioritizes more free tracked slots, then greater remaining GPU quota, then alphabetical profile name. If none is eligible, no notebook is submitted. `--account auto` needs live preflight and is incompatible with `--dry-run`; for dry runs select `--account alice` explicitly.
+An editable install (`pip install -e ".[kaggle]"`) continues using the same
+repository-root `.env` even when the shell runs from outside this folder.
 
-**Important limitation:** This is a best-effort local decision, not a Kaggle slot reservation. Jobs launched outside this runner or from another machine may not be visible in the local SQLite ledger. Kaggle makes the final submission decision. All tokens are local; the repository never synchronizes credentials or job history automatically across machines. For full diagnosis of a single account, use the existing `kgr active --remote` with that account's credentials.
-
-## Track results and ownership
+`kgr team add` prompts for each token without echoing it, updates **the same**
+`.env`, preserves unrelated settings and creates/replaces it atomically with
+`0600` permissions on POSIX. Use `--replace` to update an existing profile.
+Use the global `--env-file PATH` option if you want a one-off file selection:
 
 ```bash
+kgr --env-file "$HOME/kgr-secrets.env" team list
+kgr --env-file "$HOME/kgr-secrets.env" run ./train.py --account alice --gpu cpu
+```
+
+Lookup precedence: explicit `--env-file PATH`, then `KGR_ENV_FILE`, then
+`<kaggle-runner repository-root>/.env`. The current directory's `.env` from a
+different project is **never** used by accident. If installed from a wheel and
+running outside the checkout, provide `--env-file` or `KGR_ENV_FILE` because
+there is no discoverable project root. The `.env` file is ignored by Git.
+
+For WSL checkouts on `/mnt/c` or `/mnt/d`, DrvFs may not honor `chmod 600`
+unless mounted with `metadata`; do not disable the token permission check.
+If upgrading from the previous default `~/.config/kaggle-runner/.env`, copy
+that file to the repository root yourself (and set secure permissions).
+
+## 2. Migrate existing `team/*.env` files
+
+Earlier runner versions created one file per profile under
+`~/.config/kaggle-runner/team/`. Import them explicitly:
+
+```bash
+kgr team migrate
+# Or for a custom old directory:
+kgr team migrate --from-dir "$HOME/old-kgr-team"
+kgr team list
+```
+
+Migration copies the existing tokens to the selected `.env` once and **does not
+delete** old files. If a name or username conflicts with an existing profile,
+it stops without changing the destination. After validating the team list and
+jobs, remove/secure duplicate old credentials manually. Normal operation no
+longer reads the old directory.
+
+## 3. Check, submit, report and download
+
+```bash
+kgr team check --gpu t4x2 --required-gpu-hours 2
+kgr run ./train.ipynb --account auto --gpu t4x2 --required-gpu-hours 2
+kgr run ./train.py --account bob --gpu cpu
 kgr jobs
 kgr report --refresh
-kgr report --refresh --json --output report.json
-kgr status JOB_ID
 kgr logs JOB_ID
-kgr logs JOB_ID --json
-kgr outputs JOB_ID
 kgr fetch JOB_ID --output ./results/JOB_ID
 ```
 
-Each submitted job records `account_profile`, `account_owner` and `account_email` in the SQLite record and manifest (no token). `status`, `logs`, `outputs`, `fetch`, and `report --refresh` look up the stored profile and **use only its matching token**; they fail rather than silently switching to the default token when a profile is missing. Historical jobs without `account_profile` preserve the old single-account behavior. `kgr team check --json` and `kgr report --json` provide machine-readable results.
+`--account auto` chooses among profiles that pass their own quota/tracked-slot
+preflight. It never combines quotas across accounts. Each job stores only
+`account_profile`, `account_owner` and `account_email` in SQLite and manifests,
+**not the token**. Its status/logs/fetch always use the profile token selected
+at submission, even when the `.env` has no legacy default token. If a required
+profile is removed, access fails instead of silently using another account.
 
-The report is a point-in-time snapshot: `--refresh` queries individual job statuses, and `kgr team check` queries local activity plus remote GPU quota. Neither command is a background service.
+A profile's slot count is a local best-effort estimate. It cannot see every job
+started elsewhere, and Kaggle makes the final placement decision. Report
+metadata is bound to the account that launched each job.
 
-## Tested scenarios (offline mocks)
+## 4. Offline and real multi-account tests
 
-`python -m unittest discover -s tests -p test_team_profiles.py -v` covers required username/token, secret-file permissions, independent quotas, mixed CPU+GPU slot limits, automatic authorized profile selection, correct token selection for status/logs/fetch/reports, no fallback after a profile is removed, and no token disclosure in reports. Actual Kaggle GPU allocations require a live authorized test and consume quota.
+**Offline tests (no Kaggle calls):**
+
+```bash
+python -m unittest discover -s tests -p 'test_team_env.py' -v
+python -m unittest discover -s tests -p 'test_team_profiles.py' -v
+python -m unittest discover -s tests -v
+```
+
+**Live integration test (two real Kaggle submissions):**
+
+```bash
+python examples/team-env-multi-account/run_live_test.py \
+  --accounts alice bob \
+  --gpu cpu \
+  --confirm-live
+```
+
+Requires Kaggle CLI credentials for **both** accounts in `.env`. It submits a
+private, CPU-only notebook to each account, polls both, downloads their artifacts
+and logs, and checks per-job account metadata. It will consume Kaggle compute
+and may leave remote jobs if interrupted. It is intentionally **not run by the
+unit test suite**. To submit without waiting, add `--no-wait`. For a GPU smoke
+instead, use `--gpu t4x2 --required-gpu-hours 1`; this consumes GPU quota.
+
+The local smoke file is `examples/team-env-multi-account/smoke.py` (standard
+library only, writes `team_smoke_result.json`). No notebook package includes
+an API token or `.env` content. The integration test needs real Kaggle access,
+which cannot be simulated by unit tests.

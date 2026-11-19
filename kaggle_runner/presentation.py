@@ -153,6 +153,9 @@ def format_output(data: dict | list, command: str = "") -> str:
                              "; ".join(item.get("reasons") or [])[:70]])
             lines.extend(_table(rows, ["PROFILE", "USERNAME", "STATUS", "SLOTS", "GPU", "REASON"]))
             return "\n".join(lines)
+        if "imported_profiles" in data:
+            return (f"Imported {data['count']} profiles into {data['env_file']} "
+                    "(legacy credential files kept)")
         return f"Saved team profile: {data.get('profile', '?')} ({data.get('owner', '?')})" + (
             f" <{data['email']}>" if data.get('email') else "")
     if command == "quota" and isinstance(data, dict):

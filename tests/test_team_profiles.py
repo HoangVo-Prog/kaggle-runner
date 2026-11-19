@@ -24,7 +24,8 @@ class AuthorizedTeamTests(unittest.TestCase):
         self.root = Path(self.sandbox.name)
         env = {k: v for k, v in os.environ.items() if k not in (
             "KAGGLE_OWNER", "KAGGLE_API_TOKEN", "EMAIL", "KGR_ENV_FILE", "KGR_PROFILE")}
-        env["KGR_TEAM_DIR"] = str(self.root / "team")
+        env["KGR_ENV_FILE"] = str(self.root / ".env")
+        env["KGR_TEAM_DIR"] = str(self.root / "team")  # migration-only old directory
         env["XDG_CONFIG_HOME"] = str(self.root / "config")
         self.env_patch = patch.dict(os.environ, env, clear=True)
         self.env_patch.start()
@@ -82,10 +83,12 @@ class AuthorizedTeamTests(unittest.TestCase):
         self.assertEqual(profiles(), ["alice", "bob"])
         self.assertEqual(get_profile("alice").owner, "aliceuser")
         self.assertIsNone(get_profile("bob").email)
-        path = self.root / "team" / "alice.env"
+        path = self.root / ".env"
         if os.name != "nt":
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        self.assertIn("KAGGLE_OWNER=aliceuser", path.read_text())
+        self.assertIn("KGR_TEAM_ALICE_USERNAME=aliceuser", path.read_text())
+        self.assertIn("KGR_TEAM_BOB_API_TOKEN=bob-token", path.read_text())
+        self.assertIn("KGR_TEAM_PROFILES=alice,bob", path.read_text())
         code, out = self.invoke("team", "list", "--json")
         self.assertEqual(code, 0)
         self.assertNotIn("alice-token", out)
@@ -101,12 +104,14 @@ class AuthorizedTeamTests(unittest.TestCase):
         with self.assertRaisesRegex(RunnerError, "API token is already"):
             add_profile("alice3", token="alice-token", owner="distinct-owner")
 
-    def test_team_commands_ignore_unrelated_legacy_env_file(self):
+    def test_team_and_legacy_single_account_share_env_without_credentials_mixing(self):
         self.setup_accounts()
-        bad_env = self.root / ".env"
-        bad_env.write_text("KAGGLE_API_TOKEN=legacy-should-not-be-used\n", encoding="utf-8")
-        if os.name != "nt":
-            bad_env.chmod(0o644)  # legacy creds deliberately unsafe/unreadable
+        # A single .env stores both legacy default and team profiles; selecting a
+        # team account must never forward the default account's credentials.
+        from kaggle_runner.accounts import write_account, load_account
+        write_account(None, "legacy_owner", "legacy@example.test", "legacy-secret")
+        self.assertEqual(load_account().token, "legacy-secret")
+        self.assertEqual(profiles(), ["alice", "bob"])
         with patch.object(KaggleCLI, "call", self.mock_call):
             code, out = self.invoke("team", "list", "--json")
             self.assertEqual(code, 0)
@@ -115,7 +120,7 @@ class AuthorizedTeamTests(unittest.TestCase):
                                     "--account", "alice", "--json")
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out)["account_profile"], "alice")
-        self.assertFalse(any(token == "legacy-should-not-be-used" for token, _ in self.calls))
+        self.assertFalse(any(token == "legacy-secret" for token, _ in self.calls))
 
     def test_cli_add_stdin_token_without_echo_and_human_output(self):
         with patch("sys.stdin", StringIO("stdin-token-secret\n")):
@@ -233,7 +238,12 @@ class AuthorizedTeamTests(unittest.TestCase):
             code, out = self.invoke("run", str(self.source), "--account", "alice", "--gpu", "cpu", "--json")
         self.assertEqual(code, 0)
         job_id = json.loads(out)["job_id"]
-        (self.root / "team" / "alice.env").unlink()
+        env_path = self.root / ".env"
+        content = env_path.read_text()
+        env_path.write_text("\n".join(line for line in content.splitlines()
+                           if not line.startswith("KGR_TEAM_ALICE_")) + "\n")
+        if os.name != "nt":
+            env_path.chmod(0o600)
         self.calls.clear()
         code, out = self.invoke("status", job_id)
         self.assertEqual(code, 2)

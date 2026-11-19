@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import __version__
 from .accounts import Account, interactive_init, load_account
-from .team import add_profile, interactive_add, get_profile, profiles, public_profiles
+from .team import add_profile, interactive_add, get_profile, profiles, public_profiles, migrate_legacy_profiles
 from .preflight import check_preflight, active_report, tracked_active_report, quota_report
 from .api import KaggleCLI
 from .config import RunnerError, build_settings, load_config
@@ -41,7 +41,7 @@ def _progress(message: str) -> None:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="kgr", description="Portable Kaggle Python repo runner")
     p.add_argument("--config", help="Optional TOML config (default: XDG_CONFIG_HOME/kaggle-runner/config.toml)")
-    p.add_argument("--env-file", help="Path to private .env for KAGGLE_OWNER, EMAIL, KAGGLE_API_TOKEN")
+    p.add_argument("--env-file", help="Private .env for default account AND team profiles")
     p.add_argument("--state-dir", help="Override state directory; paths are resolved on this machine")
     p.add_argument("--profile", help="Saved Kaggle credential alias (isolated per command)")
     p.add_argument("--version", action="version", version=__version__)
@@ -61,13 +61,15 @@ def parser() -> argparse.ArgumentParser:
 
     team = sub.add_parser("team", help="Manage explicitly authorized Kaggle account profiles")
     tm = team.add_subparsers(dest="team_command", required=True)
-    t_add = tm.add_parser("add", help="Save API token and mandatory username in a private local profile")
+    t_add = tm.add_parser("add", help="Save profile username/token in the shared private .env")
     t_add.add_argument("alias", help="Short local label, e.g. gpu-alice")
     t_add.add_argument("--username", required=True, help="Kaggle profile URL username (required for kernel ID)")
     t_add.add_argument("--email", help="Optional contact metadata; never used for authentication")
     t_add.add_argument("--token-stdin", action="store_true", help="Read API token from stdin without command history")
     t_add.add_argument("--replace", action="store_true", help="Explicitly replace an existing credential profile")
-    tm.add_parser("list", help="Show local profile metadata (never prints tokens)")
+    tm.add_parser("list", help="Show .env profile metadata (never prints tokens)")
+    t_migrate = tm.add_parser("migrate", help="Import legacy team/*.env profiles into one .env (keeps originals)")
+    t_migrate.add_argument("--from-dir", help="Old team profile directory (default legacy location)")
     t_check = tm.add_parser("check", help="Check slots and GPU quota separately for each team profile")
     t_check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
     t_check.add_argument("--required-gpu-hours", type=float, default=0.25)
@@ -192,22 +194,27 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-def _client_for_job(settings, fallback: KaggleCLI, job: dict) -> KaggleCLI:
+def _client_for_job(settings, fallback: KaggleCLI, job: dict, env_file: str | None = None) -> KaggleCLI:
     """Rebind every follow-up to the original account token; fail if it is missing."""
     alias = job.get("account_profile")
-    return KaggleCLI(settings, token=get_profile(alias).token) if alias else fallback
+    if alias:
+        return KaggleCLI(settings, token=get_profile(alias, env_file).token)
+    if env_file and not fallback.token:
+        raise RunnerError("Historical job has no account profile and explicit .env has no default token")
+    return fallback
 
 
-def _team_statuses(settings, store: JobStore, *, gpu: str, hours: float, limit: int) -> list[dict]:
+def _team_statuses(settings, store: JobStore, *, gpu: str, hours: float, limit: int,
+                   env_file: str | None = None) -> list[dict]:
     # Different tokens use independent Kaggle processes and SQLite connections.
     # A small pool avoids a slow serial scan across a whole research group.
-    aliases = profiles()
+    aliases = profiles(env_file)
     if not aliases:
         return []
 
     def inspect(alias: str) -> dict:
         try:
-            profile = get_profile(alias)
+            profile = get_profile(alias, env_file)
             client = KaggleCLI(settings, token=profile.token)
             checked = check_preflight(client, store=store, gpu=gpu,
                         required_gpu_hours=hours, max_concurrent=limit,
@@ -229,8 +236,15 @@ def dispatch(a: argparse.Namespace) -> int:
     # load, credentials from an unrelated single-account .env in the checkout.
     uses_team = a.command == "team" or (a.command == "run" and bool(a.account))
     account = Account(None, None, None, None) if uses_team else load_account(a.env_file)
-    if not uses_team and a.env_file and a.command != "auth" and not account.token:
-        raise RunnerError("Explicit --env-file has no KAGGLE_API_TOKEN; run `kgr --env-file PATH auth init`")
+    # Explicit .env may contain only team profiles, without a default token.
+    # Job follow-ups are rebound to their saved team profile, so do not require
+    # an unrelated KAGGLE_API_TOKEN at CLI startup.
+    requires_default = (a.command in {"check", "quota", "active"} or
+                        (a.command == "run" and not a.account) or
+                        (a.command == "doctor" and a.online))
+    if not uses_team and a.env_file and requires_default and not account.token:
+        raise RunnerError("Explicit --env-file has no default KAGGLE_API_TOKEN; "
+                          "use --account ALIAS for team jobs or `kgr auth init`")
     if not uses_team and a.profile and account.token:
         raise RunnerError("--profile cannot be combined with KAGGLE_API_TOKEN in .env; choose one authentication method")
     cli = KaggleCLI(settings, token=account.token)
@@ -245,14 +259,17 @@ def dispatch(a: argparse.Namespace) -> int:
     if a.command == "team":
         if a.team_command == "add":
             _emit(interactive_add(a.alias, owner=a.username, email=a.email,
-                                  stdin_token=a.token_stdin, replace=a.replace))
+                                  stdin_token=a.token_stdin, replace=a.replace, env_file=a.env_file))
             return 0
         if a.team_command == "list":
-            _emit(public_profiles())
+            _emit(public_profiles(a.env_file))
+            return 0
+        if a.team_command == "migrate":
+            _emit(migrate_legacy_profiles(env_file=a.env_file, from_dir=a.from_dir))
             return 0
         store = JobStore(settings.state)
         rows = _team_statuses(settings, store, gpu=a.gpu,
-                              hours=a.required_gpu_hours, limit=a.max_concurrent)
+                              hours=a.required_gpu_hours, limit=a.max_concurrent, env_file=a.env_file)
         _emit({"accounts": rows, "ready_count": sum(1 for r in rows if r["ok"]),
                "total": len(rows)})
         return 0 if rows and any(r["ok"] for r in rows) else 3
@@ -366,7 +383,7 @@ def dispatch(a: argparse.Namespace) -> int:
                 if a.dry_run:
                     raise RunnerError("--account auto requires online preflight (not available with --dry-run)")
                 candidates = _team_statuses(settings, store, gpu=a.gpu,
-                                hours=a.required_gpu_hours, limit=a.max_concurrent)
+                                hours=a.required_gpu_hours, limit=a.max_concurrent, env_file=a.env_file)
                 eligible = [r for r in candidates if r["ok"]]
                 if not eligible:
                     summary = "; ".join(r.get("account_profile", "?") + ": " +
@@ -376,9 +393,9 @@ def dispatch(a: argparse.Namespace) -> int:
                 eligible.sort(key=lambda r: (-(a.max_concurrent - r["active"]["running_count"]),
                                         -(r["gpu_quota"] or {}).get("remaining_hours", 0),
                                         r["account_profile"]))
-                selected_profile = get_profile(eligible[0]["account_profile"])
+                selected_profile = get_profile(eligible[0]["account_profile"], a.env_file)
             else:
-                selected_profile = get_profile(a.account)
+                selected_profile = get_profile(a.account, a.env_file)
             if a.owner and a.owner != selected_profile.owner:
                 raise RunnerError("--owner cannot override the username of a saved team profile")
             owner = selected_profile.owner
@@ -406,7 +423,7 @@ def dispatch(a: argparse.Namespace) -> int:
             job_id = result["job_id"]
             deadline = time.monotonic() + a.max_wait_minutes * 60
             while True:
-                current = refresh_status(_client_for_job(settings, cli, store.get(job_id)), store, job_id)
+                current = refresh_status(_client_for_job(settings, cli, store.get(job_id), a.env_file), store, job_id)
                 _emit({"job_id": job_id, "status": current["status"]})
                 if current["status"] in {"complete", "error", "cancelled"}:
                     break
@@ -417,7 +434,7 @@ def dispatch(a: argparse.Namespace) -> int:
                 time.sleep(min(remaining, a.poll_seconds))
             if a.fetch:
                 target = a.output.replace("{job_id}", job_id) if a.output else None
-                _emit(fetch_job(_client_for_job(settings, cli, store.get(job_id)), store, settings.state, job_id, target, force=False))
+                _emit(fetch_job(_client_for_job(settings, cli, store.get(job_id), a.env_file), store, settings.state, job_id, target, force=False))
             if current["status"] != "complete":
                 return 2
     elif a.command in {"report", "sync"}:
@@ -429,7 +446,7 @@ def dispatch(a: argparse.Namespace) -> int:
                 if item["status"] in {"prepared", "submit_failed"}:
                     continue
                 try:
-                    result = refresh_status(_client_for_job(settings, cli, item), store, item["job_id"])
+                    result = refresh_status(_client_for_job(settings, cli, item, a.env_file), store, item["job_id"])
                     item["status"] = result["status"]
                 except RunnerError as exc:
                     item["refresh_error"] = str(exc)
@@ -460,7 +477,7 @@ def dispatch(a: argparse.Namespace) -> int:
         _emit([display_job(j) for j in store.list(a.limit)])
     elif a.command == "status":
         record = store.get(a.job_id)
-        result = refresh_status(_client_for_job(settings, cli, record), store, record["job_id"])
+        result = refresh_status(_client_for_job(settings, cli, record, a.env_file), store, record["job_id"])
         result.update({k: record.get(k) for k in ("account_profile", "account_owner", "account_email")})
         _emit(result)
     elif a.command == "logs":
@@ -468,7 +485,7 @@ def dispatch(a: argparse.Namespace) -> int:
         args = ["kernels", "logs", job["kernel_ref"]]
         if a.follow:
             args.append("--follow")
-        job_cli = _client_for_job(settings, cli, job)
+        job_cli = _client_for_job(settings, cli, job, a.env_file)
         if not _JSON_OUTPUT.get():
             print(f"Account: {job.get('account_profile') or 'default'} / {job.get('account_owner') or job['kernel_ref'].split('/')[0]}"
                   + (f" ({job['account_email']})" if job.get('account_email') else ""), flush=True)
@@ -487,13 +504,13 @@ def dispatch(a: argparse.Namespace) -> int:
             store.update(a.job_id, last_message=safe_logs[-4000:])
     elif a.command == "fetch":
         record = store.get(a.job_id)
-        outcome = fetch_job(_client_for_job(settings, cli, record), store, settings.state,
+        outcome = fetch_job(_client_for_job(settings, cli, record, a.env_file), store, settings.state,
                             record["job_id"], a.output, force=a.force, file_pattern=a.file_pattern)
         outcome.update({k: record.get(k) for k in ("account_profile", "account_owner", "account_email")})
         _emit(outcome)
     elif a.command == "outputs":
         job = store.get(a.job_id)
-        res = _client_for_job(settings, cli, job).call("kernels", "files", job["kernel_ref"], "--format", "json")
+        res = _client_for_job(settings, cli, job, a.env_file).call("kernels", "files", job["kernel_ref"], "--format", "json")
         try:
             _emit({"job_id": job["job_id"], "account_profile": job.get("account_profile"),
                    "account_owner": job.get("account_owner"),
