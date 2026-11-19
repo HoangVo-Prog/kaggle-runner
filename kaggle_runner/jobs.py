@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,10 +36,15 @@ class JobStore:
             )""")
             con.execute("CREATE INDEX IF NOT EXISTS jobs_created_idx ON jobs(created_at)")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         con = sqlite3.connect(self.path, timeout=30)
         con.row_factory = sqlite3.Row
-        return con
+        try:
+            with con:
+                yield con
+        finally:
+            con.close()
 
     def add(self, record: dict) -> None:
         row = {**record, "created_at": utc_now(), "updated_at": utc_now()}
@@ -49,7 +56,7 @@ class JobStore:
     def update(self, job_id: str, **fields: str) -> None:
         if not fields:
             return
-        if any(key not in {"status", "output_dir", "last_message"} for key in fields):
+        if any(key not in {"status", "output_dir", "last_message", "kernel_ref"} for key in fields):
             raise ValueError("Unsupported update field")
         fields["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = ?" for key in fields)

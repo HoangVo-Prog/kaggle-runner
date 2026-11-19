@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -11,12 +12,12 @@ from .api import KaggleCLI
 from .config import RunnerError, build_settings, load_config
 from .datasets import download_dataset, inspect_local, prepare_dataset, upload_dataset
 from .jobs import JobStore, display_job
-from .packaging import validate_ref
+from .packaging import validate_ref, validate_model_ref
 from .runner import create_job, fetch_job, refresh_status
 
 
 def _emit(value: dict | list, *, as_json: bool = True) -> None:
-    print(json.dumps(value, indent=2, ensure_ascii=False, default=str))
+    print(json.dumps(value, indent=2, ensure_ascii=False, default=str), flush=True)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -36,7 +37,8 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--owner", help="Your Kaggle username; can be set as [runner].owner in config")
     r.add_argument("--ref", help="Git branch or tag for GitHub HTTPS source")
     r.add_argument("--gpu", choices=("cpu", "t4x2"), default="cpu")
-    r.add_argument("--dataset", action="append", default=[], metavar="OWNER/SLUG", help="Attach accessible Kaggle dataset (repeatable)")
+    r.add_argument("--dataset", action="append", default=[], metavar="OWNER/SLUG", help="Attach a Kaggle dataset (repeatable; public resources need no download)")
+    r.add_argument("--model", action="append", default=[], metavar="OWNER/MODEL/FRAMEWORK/VARIATION/VERSION", help="Attach a pinned Kaggle Model variation version (repeatable)")
     r.add_argument("--unpack-datasets", action="store_true", help="Unzip payload.zip attached datasets into Kaggle working")
     r.add_argument("--arg", dest="arguments", action="append", default=[], help="Script argument (repeatable)")
     r.add_argument("--install-requirements", action="store_true", help="pip install requirements.txt inside kernel")
@@ -44,6 +46,11 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--timeout", type=int, default=0, help="Kaggle push timeout in seconds (0 = CLI default)")
     r.add_argument("--max-source-mb", type=int, default=3, help="Max compressed source ZIP in MB (default 3)")
     r.add_argument("--dry-run", action="store_true", help="Generate code/manifest only; no Kaggle calls")
+    r.add_argument("--wait", action="store_true", help="Poll the submitted job until it finishes")
+    r.add_argument("--fetch", action="store_true", help="With --wait, download outputs after completion or error")
+    r.add_argument("--output", help="With --fetch, output folder (supports {job_id} for unique runs)")
+    r.add_argument("--poll-seconds", type=int, default=20, help="Polling interval for --wait")
+    r.add_argument("--max-wait-minutes", type=int, default=45, help="Maximum monitoring time; does not cancel remote runs")
 
     j = sub.add_parser("jobs", help="List locally tracked jobs")
     j.add_argument("--limit", type=int, default=30)
@@ -59,6 +66,8 @@ def parser() -> argparse.ArgumentParser:
 
     ds = sub.add_parser("dataset", help="Manage local/public/accessible-private Kaggle datasets")
     ds_sub = ds.add_subparsers(dest="dataset_command", required=True)
+    ds_search = ds_sub.add_parser("search", help="Find public Kaggle datasets")
+    ds_search.add_argument("query", help="Search phrase")
     ins = ds_sub.add_parser("inspect", help="Inspect local folder or remote accessible dataset")
     ins.add_argument("source", help="Folder or owner/slug")
     upl = ds_sub.add_parser("upload", help="Bundle local folder and create PRIVATE Kaggle dataset")
@@ -73,6 +82,13 @@ def parser() -> argparse.ArgumentParser:
     dl.add_argument("--ref", required=True)
     dl.add_argument("--output", required=True)
     dl.add_argument("--unzip", action="store_true", help="Unzip download archive")
+
+    models = sub.add_parser("model", help="Explore Kaggle Models (not the Model Proxy API)")
+    models_sub = models.add_subparsers(dest="model_command", required=True)
+    m_search = models_sub.add_parser("search", help="Find Kaggle models")
+    m_search.add_argument("query", help="Search phrase")
+    m_files = models_sub.add_parser("files", help="List files in a pinned model version")
+    m_files.add_argument("ref", help="owner/model/framework/variation/version")
     return p
 
 
@@ -93,6 +109,10 @@ def dispatch(a: argparse.Namespace) -> int:
         # Previously doctor --online exited successfully even after auth failure.
         return 0 if check.returncode == 0 and (not a.online or report.get("kaggle_auth_ok", False)) else 1
     if a.command == "dataset":
+        if a.dataset_command == "search":
+            result = cli.call("datasets", "list", "--search", a.query)
+            _emit({"query": a.query, "results": result.text})
+            return 0
         if a.dataset_command == "inspect":
             path = Path(a.source).expanduser()
             if path.is_dir():
@@ -120,16 +140,52 @@ def dispatch(a: argparse.Namespace) -> int:
             msg = download_dataset(cli, a.ref, Path(a.output).expanduser().resolve(), unzip=a.unzip)
             _emit({"ref": a.ref, "output": str(Path(a.output).expanduser().resolve()), "message": msg})
             return 0
+    if a.command == "model":
+        if a.model_command == "search":
+            result = cli.call("models", "list", "--search", a.query)
+            _emit({"query": a.query, "results": result.text})
+        elif a.model_command == "files":
+            ref = validate_model_ref(a.ref)
+            result = cli.call("models", "variations", "versions", "files", ref)
+            _emit({"model_ref": ref, "files_output": result.text})
+        return 0
     store = JobStore(settings.state)
     if a.command == "run":
+        if a.fetch and not a.wait:
+            raise RunnerError("--fetch requires --wait")
+        if (a.wait or a.fetch) and a.dry_run:
+            raise RunnerError("--wait/--fetch cannot be used with --dry-run")
+        if a.poll_seconds < 1 or a.max_wait_minutes < 1:
+            raise RunnerError("--poll-seconds and --max-wait-minutes must be positive")
+        if a.output and not a.fetch:
+            raise RunnerError("--output requires --fetch")
         config = load_config(a.config)
         owner = a.owner or config.get("runner", {}).get("owner")
         result = create_job(settings, cli, store, source=a.source, entry=a.entry, owner=owner,
                             gpu=a.gpu, dataset_refs=a.dataset, arguments=a.arguments,
                             install_requirements=a.install_requirements, enable_internet=a.enable_internet,
                             max_source_mb=a.max_source_mb, timeout_seconds=a.timeout,
-                            dry_run=a.dry_run, git_ref=a.ref, unpack_datasets=a.unpack_datasets)
+                            dry_run=a.dry_run, git_ref=a.ref, unpack_datasets=a.unpack_datasets,
+                            model_refs=a.model)
         _emit(result)
+        if a.wait:
+            job_id = result["job_id"]
+            deadline = time.monotonic() + a.max_wait_minutes * 60
+            while True:
+                current = refresh_status(cli, store, job_id)
+                _emit({"job_id": job_id, "status": current["status"]})
+                if current["status"] in {"complete", "error", "cancelled"}:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(f"kgr: watch timed out; remote job {job_id} may still be running", file=sys.stderr)
+                    return 3
+                time.sleep(min(remaining, a.poll_seconds))
+            if a.fetch:
+                target = a.output.replace("{job_id}", job_id) if a.output else None
+                _emit(fetch_job(cli, store, settings.state, job_id, target, force=False))
+            if current["status"] != "complete":
+                return 2
     elif a.command == "jobs":
         if a.limit < 1:
             raise RunnerError("--limit must be >= 1")

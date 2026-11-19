@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -10,14 +11,15 @@ from .api import KaggleCLI
 from .config import RunnerError, Settings
 from .jobs import JobStore
 from .packaging import (make_bootstrap, pack_source, resolve_source,
-                        slugify, validate_ref)
+                        slugify, validate_ref, validate_model_ref)
 
 
 def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: str,
                entry: str, owner: str, gpu: str, dataset_refs: list[str], arguments: list[str],
                install_requirements: bool = False, enable_internet: bool = False,
                max_source_mb: int = 3, timeout_seconds: int = 0, dry_run: bool = False,
-               git_ref: str | None = None, unpack_datasets: bool = False) -> dict:
+               git_ref: str | None = None, unpack_datasets: bool = False,
+               model_refs: list[str] | None = None) -> dict:
     if not owner:
         raise RunnerError("Kaggle username is not configured. Pass --owner with the username from your Kaggle profile URL, or set [runner].owner in config.toml (not your display name).")
     if not owner.replace("-", "").replace("_", "").isalnum():
@@ -31,6 +33,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     if gpu not in {"cpu", "t4x2"}:
         raise RunnerError("Only cpu and t4x2 are supported in P0")
     refs = list(dict.fromkeys(validate_ref(d, "dataset reference") for d in dataset_refs))
+    models = list(dict.fromkeys(validate_model_ref(m) for m in (model_refs or [])))
     job_id = uuid.uuid4().hex
     job_dir = settings.state / "jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
@@ -42,18 +45,18 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     staging.mkdir()
     (staging / "run.py").write_text(make_bootstrap(data, entry=entry, arguments=arguments,
                     datasets=refs, install_requirements=install_requirements,
-                    unpack_datasets=unpack_datasets), encoding="utf-8")
+                    unpack_datasets=unpack_datasets, models=models), encoding="utf-8")
     metadata = {"id": kernel_ref, "title": slug.replace("-", " ").title(),
                 "code_file": "run.py", "language": "python", "kernel_type": "script",
                 "is_private": "true", "enable_gpu": "false", "enable_tpu": "false",
                 "enable_internet": "true" if enable_internet else "false",
-                "dataset_sources": refs, "competition_sources": [], "kernel_sources": [], "model_sources": []}
+                "dataset_sources": refs, "competition_sources": [], "kernel_sources": [], "model_sources": models}
     if gpu == "t4x2":
         metadata["machine_shape"] = "NvidiaTeslaT4"
     (staging / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     manifest = {"job_id": job_id, "kernel_ref": kernel_ref, "source": source,
                 "revision": revision, "entry": entry, "gpu": gpu,
-                "dataset_refs": refs, "files": files, "source_zip_sha256": hashlib.sha256(data).hexdigest(),
+                "dataset_refs": refs, "model_refs": models, "files": files, "source_zip_sha256": hashlib.sha256(data).hexdigest(),
                 "source_zip_bytes": len(data), "arguments": arguments, "install_requirements": install_requirements,
                 "enable_internet": enable_internet, "unpack_datasets": unpack_datasets,
                 "timeout_seconds": timeout_seconds}
@@ -75,6 +78,13 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     except RunnerError as exc:
         store.update(job_id, status="submit_failed", last_message=str(exc)[-4000:])
         raise RunnerError(f"Job {job_id}: {exc}") from exc
+    # Trust the canonical notebook URL printed by Kaggle, not a user-supplied owner alias.
+    remote = re.search(r"https?://(?:www\.)?kaggle\.com/code/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)", response.text)
+    if remote:
+        kernel_ref = f"{remote.group(1)}/{remote.group(2)}"
+        store.update(job_id, kernel_ref=kernel_ref)
+        manifest["kernel_ref"] = kernel_ref
+        (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     store.update(job_id, status="submitted", last_message=response.text[-4000:])
     manifest["submit_output"] = response.text
     return manifest
