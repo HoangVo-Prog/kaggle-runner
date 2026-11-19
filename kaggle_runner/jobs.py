@@ -34,6 +34,11 @@ class JobStore:
                 output_dir TEXT,
                 last_message TEXT
             )""")
+            # Forward-only, non-destructive migration of existing SQLite histories.
+            cols = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+            for name in ("account_profile", "account_owner", "account_email"):
+                if name not in cols:
+                    con.execute(f"ALTER TABLE jobs ADD COLUMN {name} TEXT")
             con.execute("CREATE INDEX IF NOT EXISTS jobs_created_idx ON jobs(created_at)")
 
     @contextmanager
@@ -56,7 +61,7 @@ class JobStore:
     def update(self, job_id: str, **fields: str) -> None:
         if not fields:
             return
-        if any(key not in {"status", "output_dir", "last_message", "kernel_ref"} for key in fields):
+        if any(key not in {"status", "output_dir", "last_message", "kernel_ref", "account_profile", "account_owner", "account_email"} for key in fields):
             raise ValueError("Unsupported update field")
         fields["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = ?" for key in fields)

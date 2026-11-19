@@ -355,6 +355,7 @@ def _ref_candidates(record: dict, owner: str | None) -> list[str]:
 
 
 def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None = None,
+                          account_profile: str | None = None,
                           limit: int = 2, workers: int = 6, max_seconds: float = 45,
                           progress: Callable[[str], None] | None = None) -> dict:
     """Fast best-effort check of runner-tracked jobs, NOT all Kaggle sessions.
@@ -371,7 +372,8 @@ def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None 
         raise RunnerError("Local ledger exceeds safe inspection limit; archive old jobs first")
     # Never filter local jobs by owner metadata: Kaggle can return a different
     # canonical owner during submit, and mixed CPU/GPU runs share one cap.
-    candidates = [r for r in records if r["status"] in LOCAL_CANDIDATES]
+    candidates = [r for r in records if r["status"] in LOCAL_CANDIDATES
+                  and (account_profile is None or r.get("account_profile") == account_profile)]
     if len(candidates) > 50:
         raise RunnerError("More than 50 local jobs need verification; use `kgr sync` to refresh old records")
     running: list[dict] = []
@@ -481,6 +483,7 @@ def check_preflight(cli: KaggleCLI, *, gpu: str, required_gpu_hours: float = 0.2
                     max_seconds: float = 45, strict: bool = False,
                     progress: Callable[[str], None] | None = None,
                     store: JobStore | None = None, owner: str | None = None,
+                    account_profile: str | None = None,
                     remote: bool | None = None) -> dict:
     if required_gpu_hours <= 0 or max_concurrent < 1 or max_concurrent > 2:
         raise RunnerError("--required-gpu-hours must be positive and --max-concurrent must be 1 or 2")
@@ -495,7 +498,7 @@ def check_preflight(cli: KaggleCLI, *, gpu: str, required_gpu_hours: float = 0.2
     else:
         if store is None:
             raise RunnerError("Fast preflight needs a local JobStore")
-        runs = tracked_active_report(cli, store, owner=owner,
+        runs = tracked_active_report(cli, store, owner=owner, account_profile=account_profile,
                                      limit=max_concurrent, workers=workers,
                                      max_seconds=max_seconds, progress=progress)
     reasons: list[str] = []

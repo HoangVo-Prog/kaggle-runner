@@ -97,6 +97,8 @@ def _run(data: dict) -> str:
         lines.append(_line("Kaggle:", f"https://www.kaggle.com/code/{data['kernel_ref']}"))
     if dry and data.get("staging_dir"):
         lines.append(_line("Staged:", data["staging_dir"]))
+    if data.get("account_profile"):
+        lines.append(_line("Account:", f"{data['account_profile']} ({data.get('account_owner') or '?'})"))
     if not dry and data.get("job_id"):
         lines.append(_line("Next:", f"kgr status {data['job_id']}"))
     return "\n".join(lines)
@@ -107,8 +109,9 @@ def _jobs(data: list[dict]) -> str:
         return "No locally tracked jobs."
     lines = [f"Tracked jobs: {len(data)}"]
     lines.extend(_table([[str(j.get("job_id", ""))[:10], str(j.get("status", "?")),
+                          str(j.get("account_profile") or "default"),
                           str(j.get("kernel_ref", "?")), str(j.get("updated_at", ""))[:16]]
-                         for j in data], ["JOB ID", "STATUS", "KERNEL", "UPDATED"], max_rows=15))
+                         for j in data], ["JOB ID", "STATUS", "ACCOUNT", "KERNEL", "UPDATED"], max_rows=15))
     return "\n".join(lines)
 
 
@@ -117,6 +120,9 @@ def _report(data: dict) -> str:
     counts = data.get("counts") or {}
     if counts:
         lines.append("Statuses: " + ", ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    by_account = data.get("by_account") or {}
+    if by_account:
+        lines.append("Accounts: " + ", ".join(f"{key}={value['total']}" for key, value in sorted(by_account.items())))
     jobs = data.get("jobs") or []
     if jobs:
         lines.append(_jobs(jobs))
@@ -125,6 +131,30 @@ def _report(data: dict) -> str:
 
 def format_output(data: dict | list, command: str = "") -> str:
     """Compact, stable-enough human presentation. --json retains original data."""
+    if command == "team" and isinstance(data, list):
+        if not data:
+            return "No team profiles. Add one with: kgr team add ALIAS --username USERNAME"
+        return "\n".join([f"Team profiles: {len(data)}", *_table(
+            [[str(x.get("account_profile", "")), str(x.get("account_owner", "")),
+              str(x.get("account_email") or "-")] for x in data],
+            ["PROFILE", "USERNAME", "EMAIL"])])
+    if command == "team" and isinstance(data, dict):
+        if "accounts" in data:
+            lines = [f"Team resource check: {data.get('ready_count', 0)}/{data.get('total', 0)} ready"]
+            rows = []
+            for item in data["accounts"]:
+                active = item.get("active") or {}
+                quota = item.get("gpu_quota") or {}
+                rows.append([str(item.get("account_profile", "?")),
+                             str(item.get("account_owner") or "?"),
+                             "READY" if item.get("ok") else "BLOCKED",
+                             str(active.get("running_count", "?")) + "/2",
+                             _num(quota.get("remaining_hours")) + "h" if quota else "-",
+                             "; ".join(item.get("reasons") or [])[:70]])
+            lines.extend(_table(rows, ["PROFILE", "USERNAME", "STATUS", "SLOTS", "GPU", "REASON"]))
+            return "\n".join(lines)
+        return f"Saved team profile: {data.get('profile', '?')} ({data.get('owner', '?')})" + (
+            f" <{data['email']}>" if data.get('email') else "")
     if command == "quota" and isinstance(data, dict):
         return _quota(data)
     if command == "active" and isinstance(data, dict):
@@ -146,7 +176,8 @@ def format_output(data: dict | list, command: str = "") -> str:
     if command in {"repair", "archive"} and isinstance(data, dict):
         return f"{data.get('status', '?')}: {str(data.get('job_id',''))[:10]}  {data.get('kernel_ref', '')}\n{data.get('note', '')}"
     if command == "status" and isinstance(data, dict):
-        return f"{str(data.get('job_id', ''))[:10]}  {data.get('status', '?')}  {data.get('kernel_ref', '')}"
+        return (f"{str(data.get('job_id', ''))[:10]}  {data.get('status', '?')}  "
+                f"[{data.get('account_profile') or 'default'}]  {data.get('kernel_ref', '')}")
     if command == "fetch" and isinstance(data, dict):
         return f"Downloaded {len(data.get('files') or [])} files to {data.get('output_dir', '?')}"
     if command == "doctor" and isinstance(data, dict):

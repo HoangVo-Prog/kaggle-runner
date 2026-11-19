@@ -21,7 +21,9 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                install_requirements: bool = False, enable_internet: bool = False,
                max_source_mb: int = 3, timeout_seconds: int = 0, dry_run: bool = False,
                git_ref: str | None = None, unpack_datasets: bool = False,
-               model_refs: list[str] | None = None, notebook_file: str | None = None) -> dict:
+               model_refs: list[str] | None = None, notebook_file: str | None = None,
+               account_profile: str | None = None, account_owner: str | None = None,
+               account_email: str | None = None) -> dict:
     if not owner:
         raise RunnerError("Kaggle username is not configured. Pass --owner with the username from your Kaggle profile URL, or set [runner].owner in config.toml (not your display name).")
     if not owner.replace("-", "").replace("_", "").isalnum():
@@ -72,7 +74,8 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     (staging / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     manifest = {"job_id": job_id, "kernel_ref": kernel_ref, "source": source,
                 "revision": revision, "entry": entry, "kernel_type": kernel_type, "gpu": gpu,
-                "dataset_refs": refs, "model_refs": models, "files": files, "source_zip_sha256": hashlib.sha256(data).hexdigest() if data else None,
+                "dataset_refs": refs, "model_refs": models, "files": files, "account_profile": account_profile, "account_owner": account_owner,
+                "account_email": account_email, "source_zip_sha256": hashlib.sha256(data).hexdigest() if data else None,
                 "source_zip_bytes": len(data), "arguments": arguments, "install_requirements": install_requirements,
                 "enable_internet": enable_internet, "unpack_datasets": unpack_datasets,
                 "timeout_seconds": timeout_seconds}
@@ -80,6 +83,8 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     store.add({"job_id": job_id, "kernel_ref": kernel_ref, "source": source,
                "source_revision": revision, "dataset_refs": json.dumps(refs),
                "status": "prepared", "profile": settings.profile,
+               "account_profile": account_profile, "account_owner": account_owner,
+               "account_email": account_email,
                "staging_dir": str(staging), "output_dir": None, "last_message": None})
     manifest["staging_dir"] = str(staging)
     manifest["dry_run"] = dry_run
@@ -157,6 +162,9 @@ def fetch_job(cli: KaggleCLI, store: JobStore, state: Path, job_id: str, output_
         entries.append({"name": p.relative_to(target).as_posix(), "bytes": p.stat().st_size,
                         "sha256": h.hexdigest()})
     payload = {"job_id": job_id, "kernel_ref": record["kernel_ref"],
+               "account_profile": record.get("account_profile"),
+               "account_owner": record.get("account_owner"),
+               "account_email": record.get("account_email"),
                "output_dir": str(target), "files": entries, "cli_output": result.text}
     (target / "kgr_download_manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     store.update(job_id, output_dir=str(target))
