@@ -62,16 +62,17 @@ class StatusParserTests(unittest.TestCase):
         self.assertEqual(parse_kernel_status(""), "unknown")
         self.assertEqual(parse_kernel_status("No status could be retrieved"), "unknown")
 
-    def test_cancel_transitions_continue_to_consume_slot(self):
+    def test_cancel_acknowledged_is_separate_from_active(self):
         api = FakeStatusAPI({
             "u/a": 'u/a has status "KernelWorkerStatus.CANCEL_REQUESTED"',
             "u/b": 'u/b has status "KernelWorkerStatus.CANCEL_ACKNOWLEDGED"',
         })
         report = active_report(api)
-        self.assertEqual(report["running_count"], 2)
-        self.assertFalse(report["has_slot"])
-        self.assertEqual({x["status"] for x in report["active"]},
-                         {"cancel_requested", "cancel_acknowledged"})
+        self.assertEqual(report["running_count"], 1)
+        self.assertTrue(report["has_slot"])
+        self.assertEqual({x["status"] for x in report["active"]}, {"cancel_requested"})
+        self.assertEqual(report["cancelling_count"], 1)
+        self.assertEqual(report["cancelling"][0]["status"], "cancel_acknowledged")
 
     def test_new_script_is_not_running(self):
         api = FakeStatusAPI({

@@ -242,7 +242,7 @@ class WorkflowTests(unittest.TestCase):
         src.write_text("print('submitted')")
         self.api.running = ["test/run-a", "test/run-b"]
         args = ["--env-file", str(self.env), "--state-dir", str(self.settings.state),
-                "run", str(src), "--gpu", "t4x2", "--required-gpu-hours", "1.5"]
+                "run", str(src), "--gpu", "t4x2", "--required-gpu-hours", "1.5", "--remote"]
         with patch.object(KaggleCLI, "call", self.api.call), redirect_stdout(StringIO()):
             self.assertEqual(main(args), 2)
         self.assertFalse(any(c[:2] == ("kernels", "push") for c in self.api.calls))

@@ -14,13 +14,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from typing import Any, Callable
 
 from .api import KaggleCLI
+from .jobs import JobStore
 from .config import RunnerError
 from .status import parse_kernel_status
 
 # Count cancellation transitions conservatively: a cancellation request or
 # acknowledgement is not proof that the Kaggle worker released its slot.
 ACTIVE = {"running", "queued", "pending", "initializing", "starting",
-          "cancel_requested", "cancel_acknowledged"}
+          "cancel_requested"}
+# Cancellation acknowledgement can persist in the historical kernel status after
+# Kaggle Active Events has no running session. It is not proof of a live slot.
+CANCELLING = {"cancel_acknowledged"}
+LOCAL_CANDIDATES = ACTIVE | CANCELLING | {"submitted", "status_unavailable", "unknown"}
 TERMINAL = {"complete", "error", "cancelled", "failed", "new_script"}
 
 
@@ -182,6 +187,7 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
     deadline = time.monotonic() + max_seconds
     seen: set[str] = set()
     active: list[dict] = []
+    cancelling: list[dict] = []
     not_started: list[dict] = []
     missing_sessions: list[dict] = []
     scanned = 0
@@ -196,6 +202,8 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
     def snapshot() -> dict:
         return {"running_count": len(active), "max_concurrent": limit,
                 "has_slot": len(active) < limit, "active": active, "scanned": scanned,
+                "cancelling": cancelling, "cancelling_count": len(cancelling),
+                "source": "remote_batch_scan", "slot_guaranteed": False,
                 "live_checked_count": live_checked,
                 "listed_terminal_count": listed_terminal,
                 "missing_sessions": missing_sessions,
@@ -287,6 +295,8 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
                             missing_sessions.append({"kernel_ref": ref, "listed_status": listed})
                         elif status in ACTIVE:
                             active.append({"kernel_ref": ref, "status": status})
+                        elif status in CANCELLING:
+                            cancelling.append({"kernel_ref": ref, "status": status})
                         elif status == "new_script":
                             not_started.append({"kernel_ref": ref, "status": status})
                 except FuturesTimeout as exc:
@@ -297,7 +307,7 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
                         "cannot verify free slots. Retry or increase --max-seconds."
                     ) from exc
             notify(f"Verified {live_checked} live statuses; {len(active)} active, "
-                   f"{len(missing_sessions)} missing sessions.")
+                   f"{len(cancelling)} cancelling, {len(missing_sessions)} missing sessions.")
             if len(active) >= limit:
                 notify("Concurrent limit reached; stopping early without scanning older notebooks.")
                 return snapshot()
@@ -311,15 +321,121 @@ def active_report(cli: KaggleCLI, *, page_size: int = 100, max_pages: int = 5,
     )
 
 
+def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None = None,
+                          limit: int = 2, workers: int = 6, max_seconds: float = 45,
+                          progress: Callable[[str], None] | None = None) -> dict:
+    """Fast best-effort check of runner-tracked jobs, NOT all Kaggle sessions.
+
+    Only statuses that might still run are refreshed. Completed/cancelled jobs
+    are excluded from the status requests. Cancellation acknowledgements are
+    presented separately as uncertain; they do not prove an occupied slot.
+    The Kaggle service remains the final authority at submission time.
+    """
+    if not 1 <= workers <= 16 or max_seconds <= 0:
+        raise RunnerError("--workers must be 1-16 and --max-seconds must be positive")
+    records = store.list(10001)
+    if len(records) > 10000:
+        raise RunnerError("Local ledger exceeds safe inspection limit; archive old jobs first")
+    candidates = [r for r in records
+                  if r["status"] in LOCAL_CANDIDATES
+                  and (not owner or r["kernel_ref"].split("/", 1)[0].lower() == owner.lower())]
+    if len(candidates) > 50:
+        raise RunnerError("More than 50 local jobs need verification; use `kgr sync` to refresh old records")
+    running: list[dict] = []
+    cancelling: list[dict] = []
+    missing: list[dict] = []
+    not_started: list[dict] = []
+    checked = 0
+    deadline = time.monotonic() + max_seconds
+    if progress:
+        progress(f"Checking {len(candidates)} runner-tracked jobs (no notebook listing).")
+
+    def probe(record: dict, seconds: float) -> tuple[dict, str]:
+        ref = record["kernel_ref"]
+        try:
+            result = cli.call("kernels", "status", ref, check=False,
+                              timeout_seconds=seconds)
+        except RunnerError as exc:
+            raise RunnerError(f"Could not verify tracked job {ref}: {exc}") from exc
+        if result.returncode:
+            if _session_not_found(result.text):
+                return record, "missing"
+            raise RunnerError(f"Could not verify tracked job {ref}: {result.text[-300:]}")
+        state = _status(result.text)
+        if state == "unknown":
+            raise RunnerError(f"Unrecognized status for tracked job {ref}: "
+                              f"{' '.join(result.text.split())[:300]}")
+        return record, state
+
+    # At most `workers` concurrent subprocesses, and each has its own timeout.
+    # Very large local histories are explicitly rejected above rather than
+    # falsely declaring an available slot after checking a partial history.
+    for start in range(0, len(candidates), workers):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RunnerError("Tracked job check timed out; slot state unverified")
+        group = candidates[start:start + workers]
+        with ThreadPoolExecutor(max_workers=min(workers, len(group))) as executor:
+            futures = [executor.submit(probe, rec, min(8, max(0.1, remaining))) for rec in group]
+            try:
+                for future in as_completed(futures, timeout=remaining):
+                    record, state = future.result()
+                    checked += 1
+                    ref = record["kernel_ref"]
+                    if state == "missing":
+                        missing.append({"kernel_ref": ref, "job_id": record["job_id"]})
+                        store.update(record["job_id"], status="status_unavailable",
+                                     last_message="Remote session not found during fast preflight")
+                    else:
+                        store.update(record["job_id"], status=state)
+                        item = {"kernel_ref": ref, "job_id": record["job_id"], "status": state}
+                        if state in ACTIVE:
+                            running.append(item)
+                        elif state in CANCELLING:
+                            cancelling.append(item)
+                        elif state == "new_script":
+                            not_started.append(item)
+            except FuturesTimeout as exc:
+                for future in futures:
+                    future.cancel()
+                raise RunnerError("Tracked job check timed out; slot state unverified") from exc
+        if len(running) >= limit:
+            break
+    return {"running_count": len(running), "max_concurrent": limit,
+            "has_slot": len(running) < limit, "active": running,
+            "cancelling": cancelling, "cancelling_count": len(cancelling),
+            "missing_sessions": missing, "missing_session_count": len(missing),
+            "not_started": not_started, "not_started_count": len(not_started),
+            "scanned": len(candidates), "live_checked_count": checked,
+            "source": "tracked_jobs", "slot_guaranteed": False,
+            "note": "Only runner-tracked jobs are checked. Other notebooks and interactive "
+                    "sessions are invisible here. Cancelling acknowledgement is not proof "
+                    "of an occupied or available slot; Kaggle enforces real capacity at push."}
+
+
 def check_preflight(cli: KaggleCLI, *, gpu: str, required_gpu_hours: float = 0.25,
                     max_concurrent: int = 2, workers: int = 6,
                     max_seconds: float = 45, strict: bool = False,
-                    progress: Callable[[str], None] | None = None) -> dict:
+                    progress: Callable[[str], None] | None = None,
+                    store: JobStore | None = None, owner: str | None = None,
+                    remote: bool | None = None) -> dict:
     if required_gpu_hours <= 0 or max_concurrent < 1 or max_concurrent > 2:
         raise RunnerError("--required-gpu-hours must be positive and --max-concurrent must be 1 or 2")
-    runs = active_report(cli, limit=max_concurrent, workers=workers,
-                         max_seconds=max_seconds, strict=strict, progress=progress)
-    reasons = []
+    # Backward compatibility for Python callers without a local JobStore;
+    # the CLI supplies it and therefore defaults to the fast tracked-job mode.
+    use_remote = (store is None) if remote is None else remote
+    if strict:
+        use_remote = True
+    if use_remote:
+        runs = active_report(cli, limit=max_concurrent, workers=workers,
+                             max_seconds=max_seconds, strict=strict, progress=progress)
+    else:
+        if store is None:
+            raise RunnerError("Fast preflight needs a local JobStore")
+        runs = tracked_active_report(cli, store, owner=owner,
+                                     limit=max_concurrent, workers=workers,
+                                     max_seconds=max_seconds, progress=progress)
+    reasons: list[str] = []
     if not runs["has_slot"]:
         reasons.append(f"Concurrent batch jobs {runs['running_count']}/{max_concurrent}")
     quota = None
@@ -328,14 +444,20 @@ def check_preflight(cli: KaggleCLI, *, gpu: str, required_gpu_hours: float = 0.2
         try:
             quota = quota_report(cli)
         except RunnerError as exc:
-            # Keep the confirmed concurrency result visible. Unknown quota is
-            # not permission to submit, even if the account has a free slot.
             quota_error = str(exc)
             reasons.append(f"GPU quota unavailable: {quota_error}")
         else:
             if quota["remaining_hours"] < required_gpu_hours:
                 reasons.append(f"GPU remaining {quota['remaining_hours']}h < required {required_gpu_hours}h")
+    warnings: list[str] = []
+    if runs.get("cancelling_count", 0):
+        warnings.append(f"{runs['cancelling_count']} cancel-acknowledged notebooks: "
+                        "their live resource allocation is not confirmed")
+    if not use_remote:
+        warnings.append("Fast mode checks runner-tracked jobs only; Kaggle may have "
+                        "other active sessions. Acceptance is determined by Kaggle at submit.")
     return {"ok": not reasons, "gpu": gpu, "active": runs, "gpu_quota": quota,
             "gpu_quota_error": quota_error,
             "required_gpu_hours": required_gpu_hours if gpu != "cpu" else 0,
-            "reasons": reasons}
+            "slot_verified": False,
+            "warnings": warnings, "reasons": reasons}

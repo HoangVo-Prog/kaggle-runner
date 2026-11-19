@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import __version__
 from .accounts import interactive_init, load_account
-from .preflight import check_preflight, active_report, quota_report
+from .preflight import check_preflight, active_report, tracked_active_report, quota_report
 from .api import KaggleCLI
 from .config import RunnerError, build_settings, load_config
 from .datasets import download_dataset, inspect_local, prepare_dataset, upload_dataset
@@ -50,13 +50,15 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
     check.add_argument("--required-gpu-hours", type=float, default=0.25)
     check.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2)
+    check.add_argument("--remote", action="store_true", help="Scan remote notebook history (slow, diagnostic)")
     for command in (check,):
         command.add_argument("--workers", type=int, default=6, help="Concurrent status requests (1-16)")
         command.add_argument("--max-seconds", type=float, default=45, help="Total active-scan time budget")
         command.add_argument("--strict", action="store_true", help="Verify historical terminal entries live (slower)")
         command.add_argument("--quiet", action="store_true", help="Disable progress messages on stderr")
     sub.add_parser("quota", help="Check remaining GPU quota")
-    active = sub.add_parser("active", help="Check running/queued Kaggle batch kernels")
+    active = sub.add_parser("active", help="Check runner-tracked active jobs (or remote account with --remote)")
+    active.add_argument("--remote", action="store_true", help="Scan all visible Kaggle notebooks, including untracked jobs")
     active.add_argument("--workers", type=int, default=6, help="Concurrent status requests (1-16)")
     active.add_argument("--max-seconds", type=float, default=45, help="Total active-scan time budget")
     active.add_argument("--strict", action="store_true", help="Verify historical terminal entries live (slower)")
@@ -80,6 +82,7 @@ def parser() -> argparse.ArgumentParser:
                    help="Minimum hours needed before GPU submit (default 0.25)")
     r.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2,
                    help="Local safety cap on concurrently active batch kernels (default 2)")
+    r.add_argument("--remote", action="store_true", help="Use full remote notebook history preflight (slow)")
     r.add_argument("--workers", type=int, default=6, help="Concurrent preflight status requests (1-16)")
     r.add_argument("--max-seconds", type=float, default=45, help="Preflight active-scan time budget")
     r.add_argument("--strict", action="store_true", help="Verify historical terminal entries live")
@@ -164,11 +167,18 @@ def dispatch(a: argparse.Namespace) -> int:
             return 0
         scan_kwargs = {"workers": a.workers, "max_seconds": a.max_seconds,
                        "strict": a.strict, "progress": None if a.quiet else _progress}
+        store = JobStore(settings.state)
         if a.command == "active":
-            _emit(active_report(cli, **scan_kwargs))
+            if a.remote or a.strict:
+                _emit(active_report(cli, **scan_kwargs))
+            else:
+                _emit(tracked_active_report(cli, store, owner=account.owner,
+                                            workers=a.workers, max_seconds=a.max_seconds,
+                                            progress=scan_kwargs["progress"]))
             return 0
         result = check_preflight(cli, gpu=a.gpu, required_gpu_hours=a.required_gpu_hours,
-                                 max_concurrent=a.max_concurrent, **scan_kwargs)
+                                 max_concurrent=a.max_concurrent, store=store,
+                                 owner=account.owner, remote=a.remote, **scan_kwargs)
         _emit(result)
         return 0 if result["ok"] else 3
     if a.command == "doctor":
@@ -256,7 +266,8 @@ def dispatch(a: argparse.Namespace) -> int:
         owner = a.owner or account.owner or config.get("runner", {}).get("owner")
         if not a.dry_run:
             preflight = check_preflight(cli, gpu=a.gpu, required_gpu_hours=a.required_gpu_hours,
-                                        max_concurrent=a.max_concurrent,
+                                        max_concurrent=a.max_concurrent, store=store,
+                                        owner=owner, remote=a.remote,
                                         workers=a.workers, max_seconds=a.max_seconds,
                                         strict=a.strict, progress=None if a.quiet else _progress)
             if not preflight["ok"]:
