@@ -32,8 +32,25 @@ def _prefix(alias: str) -> str:
     return "KGR_TEAM_" + alias.upper().replace("-", "_") + "_"
 
 
+def _value(values: dict[str, str], key: str) -> str:
+    """Resolve manually edited .env keys without depending on alias case.
+
+    Environment variable keys themselves are case-sensitive, but .env team
+    profile names are declared by an alias. Reject contradictory definitions
+    rather than silently picking a token from an arbitrary spelling.
+    """
+    matches = [(name, value) for name, value in values.items()
+               if name.casefold() == key.casefold()]
+    distinct = {value for _, value in matches if value}
+    if len(distinct) > 1:
+        names = ", ".join(sorted(name for name, _ in matches))
+        raise RunnerError(f"Conflicting definitions of {key} in .env ({names}); "
+                          "remove duplicate keys. Secret values are not displayed")
+    return next(iter(distinct), "")
+
+
 def _roster(values: dict[str, str]) -> list[str]:
-    raw = values.get(ROSTER, "").strip()
+    raw = _value(values, ROSTER).strip()
     if not raw:
         return []
     names = [_alias(part.strip()) for part in raw.split(",")]
@@ -63,17 +80,46 @@ def profiles(env_file: str | None = None) -> list[str]:
 
 def get_profile(alias: str, env_file: str | None = None) -> TeamProfile:
     alias = _alias(alias)
-    values = read_env_values(preferred_env_file(env_file))
+    target = preferred_env_file(env_file)
+    values = read_env_values(target)
     if alias not in _roster(values):
-        raise RunnerError(f"Unknown team profile {alias!r}; use `kgr team list`")
+        raise RunnerError(f"Unknown team profile {alias!r} in {target}; "
+                          "use `kgr team diagnose` to inspect the selected .env")
     prefix = _prefix(alias)
-    token = values.get(prefix + "API_TOKEN", "")
-    owner = values.get(prefix + "USERNAME", "")
+    token = _value(values, prefix + "API_TOKEN")
+    owner = _value(values, prefix + "USERNAME")
     if not token or "\n" in token:
-        raise RunnerError(f"Missing API token for team profile {alias!r}")
+        raise RunnerError(f"Missing API token for team profile {alias!r} in {target}; "
+                          f"expected {prefix}API_TOKEN. Run `kgr team diagnose` "
+                          "to check which .env was loaded (tokens stay hidden)")
     if not OWNER.fullmatch(owner):
-        raise RunnerError(f"Missing or invalid username for team profile {alias!r}")
-    return TeamProfile(alias, token, owner, values.get(prefix + "EMAIL") or None)
+        raise RunnerError(f"Missing or invalid username for team profile {alias!r} "
+                          f"in {target}; expected {prefix}USERNAME")
+    return TeamProfile(alias, token, owner, _value(values, prefix + "EMAIL") or None)
+
+
+def diagnose_profiles(env_file: str | None = None) -> dict:
+    """Show the credential file path and key presence, never any API tokens."""
+    target = preferred_env_file(env_file)
+    values = read_env_values(target)
+    records = []
+    for alias in _roster(values):
+        prefix = _prefix(alias)
+        try:
+            owner = _value(values, prefix + "USERNAME")
+            token_configured = bool(_value(values, prefix + "API_TOKEN"))
+            records.append({"profile": alias, "username": owner or None,
+                            "token_configured": token_configured,
+                            "ready": bool(token_configured and OWNER.fullmatch(owner))})
+        except RunnerError as exc:
+            records.append({"profile": alias, "username": None,
+                            "token_configured": False, "ready": False,
+                            "error": str(exc)})
+    return {"env_file": str(target), "exists": target.is_file(),
+            "source": ("--env-file" if env_file else
+                       "KGR_ENV_FILE" if os.getenv("KGR_ENV_FILE") else "project-root"),
+            "profiles": records,
+            "note": "This only checks .env syntax and key presence, not Kaggle API access"}
 
 
 def add_profile(alias: str, *, token: str, owner: str, email: str | None = None,
@@ -96,9 +142,9 @@ def add_profile(alias: str, *, token: str, owner: str, email: str | None = None,
         if other == alias:
             continue
         prefix = _prefix(other)
-        if values.get(prefix + "USERNAME", "").lower() == owner.lower():
+        if _value(values, prefix + "USERNAME").lower() == owner.lower():
             raise RunnerError(f"Username {owner!r} already belongs to profile {other!r}")
-        if values.get(prefix + "API_TOKEN") == token:
+        if _value(values, prefix + "API_TOKEN") == token:
             raise RunnerError(f"This API token is already associated with profile {other!r}")
     prefix = _prefix(alias)
     updates: dict[str, str | None] = {
@@ -107,6 +153,12 @@ def add_profile(alias: str, *, token: str, owner: str, email: str | None = None,
         prefix + "API_TOKEN": token,
         prefix + "EMAIL": email or None,
     }
+    # Canonicalize old lowercase or mixed-case spellings on explicit replacement.
+    # Otherwise two keys differing only by case would remain in .env.
+    canonical_names = {key.casefold() for key in updates}
+    for original in values:
+        if original.casefold() in canonical_names and original not in updates:
+            updates[original] = None
     update_env_values(target, updates)
     return {"profile": alias, "owner": owner, "email": email,
             "token_configured": True, "env_file": str(target)}
@@ -146,8 +198,8 @@ def migrate_legacy_profiles(*, env_file: str | None = None,
     names = _roster(current)
     updates: dict[str, str | None] = {}
     imported = []
-    owners = {current.get(_prefix(n) + "USERNAME", "").lower() for n in names}
-    tokens = {current.get(_prefix(n) + "API_TOKEN") for n in names}
+    owners = {_value(current, _prefix(n) + "USERNAME").lower() for n in names}
+    tokens = {_value(current, _prefix(n) + "API_TOKEN") for n in names}
     for path in paths:
         alias = _alias(path.stem)
         if alias in names or any(_prefix(n) == _prefix(alias) for n in names):

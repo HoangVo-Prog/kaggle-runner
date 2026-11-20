@@ -139,6 +139,21 @@ def format_output(data: dict | list, command: str = "") -> str:
               str(x.get("account_email") or "-")] for x in data],
             ["PROFILE", "USERNAME", "EMAIL"])])
     if command == "team" and isinstance(data, dict):
+        if "env_file" in data and "profiles" in data:
+            lines = [f"Team .env: {data['env_file']}",
+                     f"Source:    {data['source']}",
+                     f"Exists:    {'yes' if data['exists'] else 'no'}"]
+            if data["profiles"]:
+                lines.extend(_table([[str(p.get('profile') or '?'),
+                                      str(p.get('username') or '-'),
+                                      'yes' if p.get('token_configured') else 'NO',
+                                      'OK' if p.get('ready') else 'INCOMPLETE']
+                                     for p in data["profiles"]],
+                                    ['PROFILE', 'USERNAME', 'API TOKEN', 'CONFIG']))
+                lines.extend(f"Error: {p['error']}" for p in data['profiles'] if 'error' in p)
+            else:
+                lines.append('No team profiles in selected .env')
+            return '\n'.join(lines)
         if "accounts" in data:
             lines = [f"Team resource check: {data.get('ready_count', 0)}/{data.get('total', 0)} ready"]
             rows = []

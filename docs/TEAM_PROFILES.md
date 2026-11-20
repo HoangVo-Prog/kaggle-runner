@@ -140,3 +140,25 @@ The local smoke file is `examples/team-env-multi-account/smoke.py` (standard
 library only, writes `team_smoke_result.json`). No notebook package includes
 an API token or `.env` content. The integration test needs real Kaggle access,
 which cannot be simulated by unit tests.
+
+### Troubleshooting: `Missing API token for team profile`
+
+By default `kgr` reads **`<kaggle-runner-project-root>/.env`**. However,
+`KGR_ENV_FILE` or `--env-file PATH` takes priority over that default. To inspect
+*which file is being read* without printing secrets:
+
+```bash
+kgr team diagnose
+kgr --env-file .env team diagnose
+```
+
+The diagnostic displays the resolved `.env` path and whether each roster entry
+has a username and API token, but **never prints token contents**. If an old
+`KGR_ENV_FILE` override points elsewhere, unset it (`unset KGR_ENV_FILE`) or
+select the intended file with `--env-file`.
+
+Team variable names are now accepted case-insensitively: both
+`KGR_TEAM_TOANLTV_API_TOKEN` and `KGR_TEAM_toanltv_API_TOKEN` are recognized
+for the roster alias `toanltv`. Prefer the uppercase spelling for consistency;
+if both spellings exist with different values, remove the duplicate—the runner
+fails clearly instead of guessing which credential to use.

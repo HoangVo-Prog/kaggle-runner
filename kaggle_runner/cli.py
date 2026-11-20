@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import __version__
 from .accounts import Account, interactive_init, load_account
-from .team import add_profile, interactive_add, get_profile, profiles, public_profiles, migrate_legacy_profiles
+from .team import add_profile, interactive_add, get_profile, profiles, public_profiles, migrate_legacy_profiles, diagnose_profiles
 from .preflight import check_preflight, active_report, tracked_active_report, quota_report
 from .api import KaggleCLI
 from .config import RunnerError, build_settings, load_config
@@ -68,6 +68,7 @@ def parser() -> argparse.ArgumentParser:
     t_add.add_argument("--token-stdin", action="store_true", help="Read API token from stdin without command history")
     t_add.add_argument("--replace", action="store_true", help="Explicitly replace an existing credential profile")
     tm.add_parser("list", help="Show .env profile metadata (never prints tokens)")
+    tm.add_parser("diagnose", help="Show selected .env location and configured key presence (no tokens)")
     t_migrate = tm.add_parser("migrate", help="Import legacy team/*.env profiles into one .env (keeps originals)")
     t_migrate.add_argument("--from-dir", help="Old team profile directory (default legacy location)")
     t_check = tm.add_parser("check", help="Check slots and GPU quota separately for each team profile")
@@ -263,6 +264,9 @@ def dispatch(a: argparse.Namespace) -> int:
             return 0
         if a.team_command == "list":
             _emit(public_profiles(a.env_file))
+            return 0
+        if a.team_command == "diagnose":
+            _emit(diagnose_profiles(a.env_file))
             return 0
         if a.team_command == "migrate":
             _emit(migrate_legacy_profiles(env_file=a.env_file, from_dir=a.from_dir))
