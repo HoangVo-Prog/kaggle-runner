@@ -16,6 +16,7 @@ import re
 import subprocess
 import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config import RunnerError
 
@@ -32,10 +33,34 @@ ALLOWED_SUFFIXES = {".py", ".toml", ".txt", ".yaml", ".yml", ".json", ".cfg", ".
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
+def _kaggle_web_ref(ref: str, resource: str) -> str:
+    if not ref.startswith(("https://", "http://")):
+        return ref
+    parsed = urlsplit(ref)
+    if parsed.scheme != "https" or parsed.hostname not in {"www.kaggle.com", "kaggle.com"} or parsed.query or parsed.fragment:
+        raise RunnerError(f"Invalid Kaggle {resource} URL")
+    parts = parsed.path.strip("/").split("/")
+    if not parts or parts[0] != resource:
+        raise RunnerError(f"Expected Kaggle /{resource}/... URL")
+    return "/".join(parts[1:])
+
+
 def validate_ref(ref: str, kind: str = "reference") -> str:
+    ref = _kaggle_web_ref(ref, "datasets")
     if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", ref):
         raise RunnerError(f"Invalid {kind}: {ref!r}; expected owner/slug")
     return ref.lower()
+
+
+def validate_model_ref(ref: str) -> str:
+    """A pinned Kaggle Model variation version, not a Model Proxy model ID."""
+    ref = _kaggle_web_ref(ref, "models")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[1-9][0-9]*", ref):
+        raise RunnerError(
+            f"Invalid model reference: {ref!r}; expected "
+            "owner/model/framework/variation/version (e.g. google/mobilenet-v2/tensorFlow2/130-224-classification/1)"
+        )
+    return ref
 
 
 def slugify(s: str, maxlen: int = 30) -> str:
@@ -195,6 +220,22 @@ try:
             selected = destination
         dataset_paths[dataset_ref] = str(selected)
     os.environ["KGR_DATASET_PATHS"] = json.dumps(dataset_paths)
+    os.environ["KGR_MODEL_REFS"] = json.dumps(_OPTIONS["models"])
+    model_paths = {}
+    for model_ref in _OPTIONS["models"]:
+        _, model_slug, framework, variation, version = model_ref.split("/")
+        root = pathlib.Path("/kaggle/input") / model_slug
+        # Framework names can differ in capitalization between API and disk.
+        mount = root / framework / variation / version
+        if not mount.is_dir() and root.is_dir():
+            mount = next((p for p in root.glob("*/*/*")
+                          if p.is_dir() and p.parent.parent.name.casefold() == framework.casefold()
+                          and p.parent.name.casefold() == variation.casefold()
+                          and p.name == version), mount)
+        if not mount.is_dir():
+            raise FileNotFoundError(f"Attached Kaggle model not mounted: {model_ref} (expected {mount})")
+        model_paths[model_ref] = str(mount)
+    os.environ["KGR_MODEL_PATHS"] = json.dumps(model_paths)
     os.chdir(project)
     sys.path.insert(0, str(project))
     if _OPTIONS["install_requirements"]:
@@ -224,8 +265,9 @@ finally:
 
 
 def make_bootstrap(bundle: bytes, *, entry: str, arguments: list[str], datasets: list[str],
-                   install_requirements: bool, unpack_datasets: bool = False) -> str:
-    options = {"entry": entry, "arguments": arguments, "datasets": datasets,
+                   install_requirements: bool, unpack_datasets: bool = False,
+                   models: list[str] | None = None) -> str:
+    options = {"entry": entry, "arguments": arguments, "datasets": datasets, "models": models or [],
                "install_requirements": install_requirements, "unpack_datasets": unpack_datasets}
     encoded_options = base64.b64encode(json.dumps(options).encode()).decode("ascii")
     return (_BOOTSTRAP.replace("__PAYLOAD__", base64.b64encode(bundle).decode("ascii"))

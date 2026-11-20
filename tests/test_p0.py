@@ -150,7 +150,7 @@ class P0Tests(unittest.TestCase):
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
         proc = subprocess.run([sys.executable, "-m", "kaggle_runner", "--state-dir", str(self.root / "cli-state"),
                                "run", "--source", str(self.project), "--entry", "main.py",
-                               "--owner", "my-user", "--dry-run"], text=True, capture_output=True, env=env)
+                               "--owner", "my-user", "--dry-run", "--json"], text=True, capture_output=True, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(json.loads(proc.stdout)["dry_run"])
 

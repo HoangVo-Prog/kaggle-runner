@@ -1,8 +1,0 @@
-# Optional, portable per-user configuration. Save as:
-# Linux/WSL: ~/.config/kaggle-runner/config.toml
-# Windows: %APPDATA%/kaggle-runner/config.toml
-# Or use: kgr --config /any/path/config.toml ...
-[runner]
-owner = "hoang_vo"
-# profile = "primary"          # optional: uses ~/.kaggle-profiles/primary
-# state_dir = "/custom/state"  # optional: OS-specific, never checked into shared repo

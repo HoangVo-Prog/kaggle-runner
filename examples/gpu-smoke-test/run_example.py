@@ -18,7 +18,7 @@ TERMINAL = {"complete", "error", "cancelled"}
 
 
 def call_kgr(*args: str, profile: str | None = None) -> dict:
-    command = [sys.executable, "-m", "kaggle_runner"]
+    command = [sys.executable, "-m", "kaggle_runner", "--json"]
     if profile:
         command += ["--profile", profile]
     command += list(args)

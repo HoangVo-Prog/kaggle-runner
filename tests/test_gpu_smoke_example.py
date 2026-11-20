@@ -69,6 +69,11 @@ class SmokeExampleTests(unittest.TestCase):
             config = root / "config.toml"
             config.write_text('[runner]\nowner = "sample-kaggle-user"\n', encoding="utf-8")
             env = os.environ.copy()
+            # The test must not inherit a real Kaggle account from the caller's
+            # shell or project .env: KAGGLE_OWNER intentionally outranks TOML.
+            for key in ("KAGGLE_OWNER", "KAGGLE_API_TOKEN", "EMAIL"):
+                env.pop(key, None)
+            env["KGR_ENV_FILE"] = str(root / "isolated-missing.env")
             env["KGR_STATE_DIR"] = str(root / "state")
             env["KGR_CONFIG"] = str(config)
             env["PYTHONPATH"] = str(ROOT)
