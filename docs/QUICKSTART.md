@@ -9,6 +9,8 @@ python -m pip install -e '.[kaggle]'
 kgr --help
 ```
 
+At the start of a later Codex session, first run `kgr setup status --json`. Use `kgr setup verify --offline --json` only if the checkpoint is missing or reports stale local checks. This command reuses verified components and runs offline tests only when the source/test fingerprint changed.
+
 For local inspection, validation, packaging and tests, Kaggle credentials are not needed. Remote commands require a configured Kaggle account. Team profiles live in the private project-root `.env` by default; `--env-file` or `KGR_ENV_FILE` selects another file. Use `kgr team add ALIAS --username USER` to enter credentials without echoing tokens, then `kgr team diagnose` to check configuration without calling Kaggle.
 
 ## Run the offline example

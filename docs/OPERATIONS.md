@@ -1,5 +1,27 @@
 # Operations and recovery
 
+## Persistent setup checkpoint
+
+Start each new Codex session with:
+
+```bash
+kgr setup status --json
+```
+
+If the checkpoint is ready, reuse the installed interpreter and credentials. If it reports stale components, run `kgr setup verify --offline --json`; unchanged checks retain their prior timestamps, and the offline test suite runs only when its source/dependency fingerprint changed. For remote authentication, choose one configured profile explicitly:
+
+```bash
+kgr setup verify --online --account alice --json
+```
+
+This issues one read-only `kernels list --mine` request. It does not submit work, check GPU quota, rotate accounts or edit credentials. Credential presence is not authentication: rejected checks are `failed`; network outages are `unverified` and preserve local records. Successful authentication has a separate timestamp and becomes stale after 24 hours. Local setup readiness does not depend on recent online authentication.
+
+`ready` reports local Python/package/dependency/source-test readiness. `remote_prerequisites_ready` additionally requires the Kaggle CLI, a configured account and a credential file whose permissions were verified. `online_auth_ready` is separate and reports a recent successful online check.
+
+Example: a first session sees `checkpoint_status: missing`, then runs `kgr setup verify --offline --json`. A later session sees `checkpoint_status: verified` and reuses checks in place. With unchanged Python/dependencies/source, its offline verify response has an empty `revalidated` list and lists the existing checks under `reused`.
+
+The checkpoint is under the selected `Settings.state` (`KGR_STATE_DIR` or `--state-dir`). `setup status` is read-only. Verification writes the checkpoint atomically and keeps history; it does not install packages, create credentials, or create/reset `jobs.sqlite3`. A corrupt checkpoint is preserved for operator review.
+
 ## Credentials and preflight
 
 Use private project-root `.env` for team credentials unless `--env-file` or `KGR_ENV_FILE` selects a protected file. `kgr team diagnose` checks local syntax and key presence only; `kgr team check` calls Kaggle for each profile. Never display tokens or copy them into specs, notebooks, logs or reports. Do not rely on default account selection to widen a spec's `authorization.allowed_profiles`.

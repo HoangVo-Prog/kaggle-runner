@@ -75,6 +75,15 @@ def parser() -> argparse.ArgumentParser:
     t_check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
     t_check.add_argument("--required-gpu-hours", type=float, default=0.25)
     t_check.add_argument("--max-concurrent", type=int, choices=(1, 2), default=2)
+
+    setup = sub.add_parser("setup", help="Inspect and persist local setup verification checkpoints")
+    setup_sub = setup.add_subparsers(dest="setup_command", required=True)
+    setup_sub.add_parser("status", help="Read setup checkpoint and show stale or missing checks")
+    verify_setup = setup_sub.add_parser("verify", help="Verify local setup or one explicit account online")
+    verify_mode = verify_setup.add_mutually_exclusive_group(required=True)
+    verify_mode.add_argument("--offline", action="store_true", help="Verify local prerequisites and stale source tests")
+    verify_mode.add_argument("--online", action="store_true", help="Also perform one read-only authentication check")
+    verify_setup.add_argument("--account", help="Explicit profile alias for --online; no auto selection")
     check = sub.add_parser("check", help="Check running batch kernels and GPU quota before submit")
     check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
     check.add_argument("--required-gpu-hours", type=float, default=0.25)
@@ -268,6 +277,19 @@ def _team_statuses(settings, store: JobStore, *, gpu: str, hours: float, limit: 
 
 def dispatch(a: argparse.Namespace) -> int:
     settings = build_settings(state_dir=a.state_dir, profile=a.profile, config=a.config)
+    if a.command == "setup":
+        from . import setup_checkpoint
+        if a.setup_command == "status":
+            outcome = setup_checkpoint.status(settings, a.env_file)
+        else:
+            if a.online and not a.account:
+                raise RunnerError("setup verify --online requires an explicit --account ALIAS")
+            if a.offline and a.account:
+                raise RunnerError("--account is only valid with setup verify --online")
+            outcome = setup_checkpoint.verify(settings, env_file=a.env_file,
+                                             online_account=a.account if a.online else None)
+        _emit(outcome)
+        return 0 if outcome["ok"] else 3
     from .commands.agent import dispatch_agent_command
     agent_code = dispatch_agent_command(a, settings, _emit, json_output=_JSON_OUTPUT.get())
     if agent_code is not None:

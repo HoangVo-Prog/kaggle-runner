@@ -27,6 +27,8 @@ This is the current ownership map. `agent_workflow.validate_result` remains as a
 
 Agent attempts and legacy job rows share `jobs.sqlite3`. Agent reservation transactions count held agent leases plus active legacy rows, and legacy `JobStore.add(..., admission_limit=...)` takes `BEGIN IMMEDIATE` and counts held agent leases plus active legacy rows before inserting its prepared row. Exact account aliases are used (`NULL` is the default account). Competing legacy and agent submissions therefore serialize at local admission when they use the same database. A confirmed remote terminal state releases the agent lease. Expired leases remain held until reconciliation; expiry alone is not evidence that remote compute ended.
 
+The machine-local `setup-checkpoint.json` is stored beside `jobs.sqlite3` under `Settings.state`. It records versioned local checks and an append-only verification history, never experiment state or credentials. Atomic replace plus a sidecar lock preserves concurrent verification history. Checkpoint corruption is reported and never overwritten automatically. `setup status` reads SQLite in read-only mode and never queries Kaggle; online auth success is stored separately from local readiness and becomes stale after 24 hours or credential metadata changes.
+
 ## Boundaries
 
 - One local SQLite file coordinates only processes using that file. It does not coordinate other machines or reserve Kaggle capacity.

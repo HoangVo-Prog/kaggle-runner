@@ -23,6 +23,8 @@ examples/config.toml
 # Runner state, downloaded artifacts and experiment data
 *.sqlite3
 *.sqlite3-*
+setup-checkpoint.json
+setup-checkpoint.json.lock
 gpu-smoke-results/
 /data/
 /datasets/

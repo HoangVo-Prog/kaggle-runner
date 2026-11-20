@@ -4,6 +4,9 @@ This is the concise agent command surface. Run `kgr COMMAND --help` for the pars
 
 | Command | Purpose | Machine result |
 | --- | --- | --- |
+| `kgr setup status --json` | Read local setup checkpoint; no network or database writes | Check statuses, stale findings, readiness and last tested revision |
+| `kgr setup verify --offline --json` | Recheck only missing/stale local components; run tests only for a new source fingerprint | Persisted check history and reused/revalidated lists |
+| `kgr setup verify --online --account ALIAS --json` | Add one read-only authentication check for an explicit configured account | Local checks plus account-specific auth status and last-success timestamp |
 | `kgr team diagnose [--env-file FILE]` | Check local profile file structure and key presence; no Kaggle API call | JSON object when `--json` is supplied |
 | `kgr team list --json` | List profile aliases and readiness without tokens | JSON |
 | `kgr team check [--gpu cpu\|t4x2] --json` | Remote profile preflight and local activity check | Per-profile outcomes |
