@@ -46,6 +46,7 @@ class WorkflowTests(unittest.TestCase):
 
     def create_job(self, settings, cli, store, **kwargs):
         self.pushed += 1
+        kwargs["on_submission_start"]()
         jid = kwargs["job_id"]
         kernel_ref = f"aliceowner/kgr-{slugify(self.root.name,24)}-{jid[:10]}".lower()
         store.add({"job_id": jid, "kernel_ref": kernel_ref, "source": str(self.source),
@@ -126,6 +127,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(verdict["ok"])
         self.assertIn("top-level JSON", " ".join(verdict["errors"]))
 
+    def test_empty_and_malformed_results_are_never_scientific_success(self):
+        with patch("kaggle_runner.agent_workflow._choose_account", self.account), \
+             patch("kaggle_runner.agent_workflow.create_job", self.create_job):
+            item = submit(self.spec_file, settings=self.settings)
+        ledger = AgentLedger(self.state / "jobs.sqlite3")
+        ledger.transition(item["job_id"], "remote_complete")
+        out = self.state / "outputs" / item["job_id"]
+        out.mkdir(parents=True)
+        self.jobs.update(item["job_id"], output_dir=str(out))
+        for payload in ("{}", "[]", "null", "{broken json"):
+            (out / "result.json").write_text(payload)
+            verdict = validate_result(self.settings, item["job_id"])
+            self.assertFalse(verdict["ok"], payload)
+            self.assertEqual(ledger.by_job(item["job_id"])["state"], "invalid_result")
+
     def test_missing_metrics_is_not_scientific_success(self):
         with patch("kaggle_runner.agent_workflow._choose_account", self.account), \
              patch("kaggle_runner.agent_workflow.create_job", self.create_job):
@@ -135,6 +151,24 @@ class WorkflowTests(unittest.TestCase):
         verdict = validate_result(self.settings, result["job_id"])
         self.assertFalse(verdict["ok"])
         self.assertEqual(ledger.by_job(result["job_id"])["state"], "invalid_result")
+
+    def test_reconcile_manual_review_is_not_success(self):
+        with patch("kaggle_runner.agent_workflow._choose_account", self.account), \
+             patch("kaggle_runner.agent_workflow.create_job", self.create_job):
+            submit(self.spec_file, settings=self.settings)
+        with patch("kaggle_runner.agent_workflow._remote_status", return_value="unrecognized"):
+            outcome = reconcile(self.settings)
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["outcome"], "manual_review")
+        self.assertEqual(outcome["attempts"][0]["action"], "operator_must_verify_remote_state")
+
+    def test_reconcile_manual_review_uses_failure_exit_code(self):
+        from kaggle_runner.cli import main
+        result = {"schema_version": "1.0", "ok": False, "outcome": "manual_review", "attempts": []}
+        with patch("kaggle_runner.cli.build_settings", return_value=self.settings), \
+             patch("kaggle_runner.agent_workflow.reconcile", return_value=result), \
+             patch("kaggle_runner.cli._emit"):
+            self.assertEqual(main(["--state-dir", str(self.state), "reconcile", "--json"]), 3)
 
     def test_spec_rejects_unauthorized_or_credentials_in_parameters(self):
         self.spec["parameters"] = {"api_token": "never"}

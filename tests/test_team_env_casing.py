@@ -5,6 +5,7 @@ No real Kaggle credential is required or used in these tests.
 from __future__ import annotations
 
 import json
+import re
 import os
 import tempfile
 import unittest
@@ -61,7 +62,7 @@ class CaseInsensitiveTeamEnvTests(unittest.TestCase):
         if os.name != "nt":
             other.chmod(0o600)
         os.environ["KGR_ENV_FILE"] = str(other)
-        with self.assertRaisesRegex(RunnerError, str(other)):
+        with self.assertRaisesRegex(RunnerError, re.escape(str(other))):
             get_profile("toanltv")
         report = diagnose_profiles()
         self.assertEqual(report["source"], "KGR_ENV_FILE")
@@ -78,11 +79,14 @@ class CaseInsensitiveTeamEnvTests(unittest.TestCase):
             with redirect_stdout(buf):
                 self.assertEqual(main(["--env-file", str(self.env), "team", "diagnose", *options]), 0)
             output = buf.getvalue()
-            self.assertIn(str(self.env), output)
             self.assertIn("toanltv", output)
             self.assertNotIn("case-test-secret", output)
             if options:
-                self.assertEqual(json.loads(output)["profiles"][0]["ready"], True)
+                parsed = json.loads(output)
+                self.assertEqual(parsed["env_file"], str(self.env))
+                self.assertEqual(parsed["profiles"][0]["ready"], True)
+            else:
+                self.assertIn(str(self.env), output)
 
     def test_duplicate_case_definitions_are_rejected_without_leaks(self):
         self.write("KGR_TEAM_PROFILES=toanltv\n"

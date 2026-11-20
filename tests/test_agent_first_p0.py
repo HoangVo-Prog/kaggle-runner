@@ -29,6 +29,34 @@ def _race(state: str, name: str, output):
         output.put((False, str(exc).split(":")[0]))
 
 
+def _legacy_race(state: str, name: str, output):
+    try:
+        store = JobStore(Path(state))
+        store.add({"job_id": name, "kernel_ref": f"owner/{name}", "source": "x",
+                   "source_revision": None, "dataset_refs": "[]", "status": "prepared",
+                   "profile": None, "account_profile": "team-one", "account_owner": "owner",
+                   "staging_dir": "x", "output_dir": None, "last_message": None}, admission_limit=1)
+        output.put((True, None))
+    except RunnerError as exc:
+        output.put((False, str(exc).split(":")[0]))
+
+
+def _mixed_race(state: str, name: str, kind: str, barrier, output):
+    try:
+        barrier.wait(timeout=10)
+        if kind == "agent":
+            AgentLedger(Path(state) / "jobs.sqlite3").reserve(
+                experiment_id=name, attempt_id="a", fingerprint="fp", job_id=name,
+                spec={"s": 1}, account_profile="team-one", account_owner="owner",
+                kernel_ref=f"owner/{name}", limit=1)
+        else:
+            _legacy_race(state, name, output)
+            return
+        output.put((True, None))
+    except RunnerError as exc:
+        output.put((False, str(exc).split(":")[0]))
+
+
 class SourceContractTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -161,6 +189,43 @@ class LedgerTests(unittest.TestCase):
         data = [out.get(timeout=5) for _ in processes]
         self.assertEqual(sum(int(x[0]) for x in data), 1)
         self.assertEqual(len(self.ledger.list()), 1)
+
+    def test_legacy_processes_share_atomic_admission(self):
+        out = multiprocessing.Queue()
+        processes = [multiprocessing.Process(target=_legacy_race, args=(str(self.state), f"legacy{n}", out))
+                     for n in range(2)]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(15)
+            self.assertEqual(process.exitcode, 0)
+        data = [out.get(timeout=5) for _ in processes]
+        self.assertEqual(sum(int(x[0]) for x in data), 1)
+
+    def test_legacy_admission_observes_agent_reservation(self):
+        _, created = self.reserve(profile="team-one", limit=1)
+        self.assertTrue(created)
+        with self.assertRaisesRegex(RunnerError, "SLOT_EXHAUSTED"):
+            self.jobs.add({"job_id": "legacy", "kernel_ref": "owner/legacy", "source": "x",
+                           "source_revision": None, "dataset_refs": "[]", "status": "prepared",
+                           "profile": None, "account_profile": "team-one", "account_owner": "owner",
+                           "staging_dir": "x", "output_dir": None, "last_message": None},
+                          admission_limit=1)
+
+    def test_agent_and_legacy_processes_compete_for_same_final_slot(self):
+        output = multiprocessing.Queue()
+        barrier = multiprocessing.Barrier(2)
+        processes = [
+            multiprocessing.Process(target=_mixed_race, args=(str(self.state), "agent-job", "agent", barrier, output)),
+            multiprocessing.Process(target=_mixed_race, args=(str(self.state), "legacy-job", "legacy", barrier, output)),
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(15)
+            self.assertEqual(process.exitcode, 0)
+        outcomes = [output.get(timeout=5) for _ in processes]
+        self.assertEqual(sum(int(item[0]) for item in outcomes), 1)
 
 
 if __name__ == "__main__":

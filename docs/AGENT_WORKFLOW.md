@@ -1,112 +1,54 @@
-# Agent playbook — safely run, retrieve and report experiments
+# Agent experiment lifecycle
 
-**Audience:** a coding agent running approved shell commands against `kgr`. This is a workflow specification; it does not imply that a resident agent runtime exists.
+The CLI implements a foreground lifecycle. It does not run an unattended scheduler, coordinate separate machines or prove Kaggle-wide capacity. A successful push means only that the push command returned; scientific success requires a valid result.
 
-## Goal and non-goals
+## Lifecycle map
 
-An agent should turn a scientific objective into a reproducible experiment run and a verifiable result. Today the repository provides a CLI primitive layer. Experiment planning, logging persistent intent, standardized metric evaluation, scheduling and unattended recovery require agent code or future repo features.
+| Transition | Implementation and evidence | Status |
+| --- | --- | --- |
+| `SPEC → VALIDATE` | `ExperimentSpec` JSON Schema, authorization, refs, paths, source and output checks | Implemented; offline tests |
+| `VALIDATE → PACKAGE` | Deterministic `.py`/`.ipynb` source inspection and staging, hashes and exclusions | Implemented; offline tests |
+| `PACKAGE → AUTHORIZE` | Explicit `allowed_profiles`; `auto` is scoped to that list | Implemented; remote account credentials unverified |
+| `AUTHORIZE → PREFLIGHT` | Profile quota and local active job checks | Implemented; Kaggle remains capacity authority |
+| `PREFLIGHT → RESERVE` | SQLite `BEGIN IMMEDIATE` admission across agent leases and legacy job rows | Implemented and locally tested for competing processes |
+| `RESERVE → SUBMIT` | Idempotent `(experiment_id, attempt_id)` ledger record; durable push evidence | Implemented; fake/offline coverage, Kaggle unverified |
+| `SUBMIT → RECONCILE` | Original owner and kernel ref are persisted; `not_pushed`, `submission_unknown`, `remote_confirmed` marker | Implemented; remote visibility unverified |
+| `RECONCILE → MONITOR` | Read-only status reconciliation and lease renewal; `manual_review` sets `ok: false` | Implemented; remote access unverified |
+| `MONITOR → FETCH` | Resume polls and fetches with original profile; download manifest hashes files | Implemented; remote transfer unverified |
+| `FETCH → VALIDATE` | Versioned result schema, spec identity, source, dataset, metric and artifact checks | Implemented; offline tested |
+| `VALIDATE → AGGREGATE → REPORT` | Compatible attempts only; evidence bundle has hashes and state events | Implemented; statistical assumptions require scientific review |
 
-A complete lifecycle means:
+## Recommended sequence
 
-```
-REQUEST
-   -> experiment definition / reproducibility checklist
-   -> account authorization + data availability
-   -> quota and local-slot preflight
-   -> package inspection (`--dry-run`)
-   -> submit exactly once
-   -> verify remote run identity
-   -> bounded polling / resume
-   -> fetch logs and artifacts
-   -> validate artifact hashes and expected result fields
-   -> parse metrics, compare with baseline
-   -> produce cited/evidenced experiment report
-```
+1. Read the spec and confirm research objective, privacy, compute budget, explicit authorized profiles, data/model refs, parameters and outputs.
+2. Inspect both files and schema before any external action:
 
-## 1. Make a run plan
+   ```bash
+   kgr package inspect ./experiment --entry train.py --json
+   kgr experiment validate ./experiment/experiment.json --json
+   ```
 
-Before a real push, keep a run plan (a plain text/JSON file is sufficient today) with: task objective, code revision, command, Kaggle profile alias, resource request and budget, input dataset/model versions, expected artifacts, seed, evaluation protocol, and a reproducible output directory.
+3. Check credentials and account resources. `team diagnose` is local; `team check` queries Kaggle. Platform quotas may change after preflight.
+4. Submit exactly once and save all returned identity fields:
 
-**Do not mutate the experiment source or switch datasets after approval without creating a new plan version.** A future experiment-spec schema is proposed in [Result contracts](RESULT_CONTRACT.md).
+   ```bash
+   kgr experiment submit ./experiment/experiment.json --account alice --approve --json
+   ```
 
-## 2. Preflight and package
+5. For timeout or interruption, do not resubmit. Inspect `kgr experiment show ID --json` and run `kgr reconcile --experiment-id ID --json`. A nonzero exit or `ok: false`, especially `manual_review`, requires operator review.
+6. Resume the existing experiment using `kgr experiment resume ID --wait --max-wait-minutes 45 --json`. Confirm remote completion before artifact validation.
+7. Validate each job result, aggregate only compatible attempts, then generate a report and evidence bundle:
 
-```bash
-kgr team diagnose --json
-kgr team check --gpu t4x2 --required-gpu-hours 2 --json
-kgr run ./train.py --account alice --gpu t4x2 \
-  --required-gpu-hours 2 --dry-run --json
-```
+   ```bash
+   kgr results validate JOB_ID --json
+   kgr results aggregate --experiment-id ID --json
+   kgr report experiment ID --format md
+   ```
 
-- Parse output by field, not text line position. Confirm `gpu`, `kernel_type`, `account_profile`, source revision/refs and `staging_dir`.
-- A `--dry-run` generates local files; it does not prove remote acceptance.
-- Use only accounts the owner authorized for this job. Today's `--account auto` selects among **all configured profiles**. It is not a per-request permission boundary.
+## Fail closed
 
-## 3. Submit once and retain identity
+Stop for missing/invalid credentials, authorization mismatch, quota or slot blocking, source hash drift, suspected secrets, unknown remote state, inaccessible kernel, schema mismatch, missing/inconsistent artifacts, budget excess or scientifically invalid metrics. Do not release an uncertain lease, rotate profiles, cancel/archive a remote kernel, upload private data or retry failed experiment code automatically.
 
-```bash
-kgr run ./train.py --account alice --gpu t4x2 \
-  --required-gpu-hours 2 --json
-```
+## Limits
 
-The response includes `job_id` and `kernel_ref`; store them with run-plan identity. `job_id` refers to local SQLite history; `kernel_ref` refers to Kaggle. When Kaggle returns a canonical URL, `kgr` updates the stored reference. If the command times out or exits with an ambiguous error, **do not immediately invoke it again**: remote success may have occurred. Inspect the ledger and remote link first. There is no idempotency key yet.
-
-## 4. Monitor with bounded polling
-
-Use `kgr status JOB_ID --json` until `status` is `complete`, `error` or `cancelled`, with a clear maximum wall-clock period. Prefer resuming a known job to repeating a push. A status read error should be classified as transient/recoverable only when evidence supports that conclusion; do not mark a job completed based on elapsed time.
-
-For a convenient foreground session, `kgr run --wait --fetch` exists. An agent process that is restarted must recover from the ledger via `kgr jobs --json` or saved run-plan metadata, not from a now-lost shell process.
-
-## 5. Fetch and inspect outputs
-
-```bash
-kgr logs JOB_ID --json
-kgr outputs JOB_ID --json
-kgr fetch JOB_ID --output ./results/JOB_ID --json
-```
-
-- `logs` are diagnostic evidence; **do not infer final metrics solely from loosely formatted log lines**.
-- `outputs` lists remote artifact names; `fetch` downloads files and creates `kgr_download_manifest.json` with per-file SHA256 hashes and account metadata.
-- Validate expected filenames, JSON syntax and required metrics. A remote `COMPLETE` state **does not guarantee** a valid scientific result.
-- Never execute downloaded files from an untrusted kernel as code without inspection; keep per-job output directories isolated.
-
-## 6. Aggregate and report
-
-```bash
-kgr report --refresh --output ./reports/jobs.json --json
-```
-
-This report is a **job status/inventory report**, not an accuracy or benchmark-results report. To answer scientific questions, an agent must parse application-specific result artifacts and validate their schema. A proposed standard result format and narrative report are in [Result contracts](RESULT_CONTRACT.md).
-
-Every result report should include: `job_id`, account alias + owner (never token), Kaggle URL, source commit/hash, dataset/model refs, seed, GPU mode, execution outcome, artifact paths and hashes, metric definitions and values, errors, and a statement about missing/uncertain data.
-
-## Recovery decision table
-
-| Event | Agent action |
-| --- | --- |
-| Quota too low or 2/2 tracked jobs | Do not submit on that profile. Report shortage; use a different **authorized** profile only with permission. |
-| `CANCEL_ACKNOWLEDGED` seen on a historical notebook | Show `cancelling/uncertain`; do not equate it with a currently allocated GPU, or a guaranteed free slot. |
-| Local historical ref inaccessible | Run diagnostics, inspect saved URL; seek approval before `repair` or `archive`. |
-| `kgr run` command timed out | Reconcile local ledger and remote run before another attempt. |
-| `kgr status` temporarily unavailable | Retry status lookup within bounded read-retry policy; never push again because status read failed. |
-| `status=complete` but result file missing | Mark result validation failed; preserve logs and artifacts. |
-| `status=error` | Fetch available logs; classify failure; human/agent review before any revised submission. |
-| Source commit or dataset version inconsistent with run plan | Reject result from comparison; request a corrected run plan. |
-| Token appears in captured logs or reports | Stop, redact, notify owner and rotate credentials as appropriate. |
-
-## Evidence-backed outcome categories
-
-Use one of these report outcomes rather than a binary success flag:
-
-- `SUCCESS_VALIDATED`: remote complete **and** required artifacts/metrics validated.
-- `REMOTE_COMPLETE_INVALID_OUTPUT`: remote complete but schema/artifact validation failed.
-- `REMOTE_FAILED`: Kaggle reported error/cancellation with evidence.
-- `UNKNOWN_REMOTE_STATE`: terminal state could not be verified.
-- `NOT_SUBMITTED`: dry run, blocked preflight, or explicit refusal.
-
-These are **recommended reporting values**. They are **not** currently emitted by `kgr`; avoid claiming otherwise.
-
-
-## Agent-first candidate workflow
-
-Follow the [versioned agent workflow](AGENT_WORKFLOW_P0.md) when using `kgr experiment`. Do not use legacy `kgr run` as an atomic agent scheduler until the remaining P0 integration is complete.
+The admission count is local to processes sharing the same `jobs.sqlite3`. It does not run an unattended scheduler, coordinate separate machines or prove Kaggle-wide capacity. Legacy `kgr run` now joins atomic local slot admission when it stages a job, but it does not have agent idempotency/reconciliation guarantees. Never retry an ambiguous legacy push. Live Kaggle stress testing remains unverified and requires separate operator authorization.

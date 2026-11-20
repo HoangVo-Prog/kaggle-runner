@@ -69,7 +69,7 @@ class P0Tests(unittest.TestCase):
         fake_kaggle = self.root / "fake-kaggle"
         working = fake_kaggle / "working"
         working.mkdir(parents=True)
-        compiled = bootstrap.replace("/kaggle/working", str(working)).replace("/kaggle/input", str(fake_kaggle / "input"))
+        compiled = bootstrap.replace("/kaggle/working", working.as_posix()).replace("/kaggle/input", (fake_kaggle / "input").as_posix())
         runner = self.root / "generated_run.py"
         runner.write_text(compiled, encoding="utf-8")
         process = subprocess.run([sys.executable, str(runner)], capture_output=True, text=True)
@@ -95,10 +95,14 @@ class P0Tests(unittest.TestCase):
         self.assertEqual(meta["dataset_sources"], ["other/data"])
         self.assertEqual(meta["is_private"], "true")
         self.assertEqual(self.store.get(dry["job_id"])["status"], "prepared")
+        dry_evidence = json.loads((Path(dry["staging_dir"]).parent / "submission.json").read_text())
+        self.assertEqual(dry_evidence["state"], "not_pushed")
         live = create_job(self.settings, self.cli, self.store, source=str(self.project),
                           entry="main.py", owner="my-user", gpu="cpu", dataset_refs=[],
                           arguments=[])
         self.assertEqual(self.store.get(live["job_id"])["status"], "submitted")
+        live_evidence = json.loads((Path(live["staging_dir"]).parent / "submission.json").read_text())
+        self.assertEqual(live_evidence["state"], "remote_confirmed")
         self.assertNotEqual(dry["kernel_ref"], live["kernel_ref"])
         status = refresh_status(self.cli, self.store, live["job_id"])
         self.assertEqual(status["status"], "complete")
@@ -112,6 +116,8 @@ class P0Tests(unittest.TestCase):
             create_job(self.settings, self.cli, self.store, source=str(self.project),
                        entry="main.py", owner="x", gpu="cpu", dataset_refs=[], arguments=[])
         self.assertEqual(self.store.list()[0]["status"], "submit_failed")
+        evidence_path = Path(self.store.list()[0]["staging_dir"]).parent / "submission.json"
+        self.assertEqual(json.loads(evidence_path.read_text())["state"], "submission_unknown")
 
     def test_status_permission_error_marks_record_and_guides_owner_check(self):
         live = create_job(self.settings, self.cli, self.store, source=str(self.project),

@@ -10,6 +10,12 @@ from pathlib import Path
 
 from .config import RunnerError
 
+ACTIVE_JOB_STATES = (
+    "prepared", "submitting", "submitted", "pending", "queued", "running",
+    "initializing", "starting", "cancel_requested", "cancel_acknowledged",
+    "status_unavailable", "unknown", "unknown_remote", "new_script",
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -51,12 +57,45 @@ class JobStore:
         finally:
             con.close()
 
-    def add(self, record: dict) -> None:
+    def add(self, record: dict, *, admission_limit: int | None = None) -> None:
         row = {**record, "created_at": utc_now(), "updated_at": utc_now()}
         fields = ", ".join(row)
         markers = ", ".join("?" for _ in row)
-        with self._connect() as con:
+        con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+            con.execute("BEGIN IMMEDIATE")
+            if admission_limit is not None:
+                if not 1 <= admission_limit <= 2:
+                    raise RunnerError("Invalid local admission limit")
+                profile = row.get("account_profile")
+                profile_sql = "account_profile IS NULL" if profile is None else "account_profile=?"
+                params = () if profile is None else (profile,)
+                active = ACTIVE_JOB_STATES
+                marks = ",".join("?" for _ in active)
+                held_table = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_leases'").fetchone()
+                held_count = 0
+                held_exclusion = ""
+                if held_table:
+                    held_count = con.execute(
+                        f"SELECT COUNT(*) FROM agent_leases WHERE {profile_sql} AND state='held' AND job_id<>?",
+                        (*params, row["job_id"])).fetchone()[0]
+                    held_exclusion = "AND job_id NOT IN (SELECT job_id FROM agent_leases WHERE state='held')"
+                jobs_count = con.execute(
+                    f"SELECT COUNT(*) FROM jobs WHERE {profile_sql} AND status IN ({marks}) "
+                    f"AND job_id<>? {held_exclusion}",
+                    (*params, *active, row["job_id"])).fetchone()[0]
+                if held_count + jobs_count >= admission_limit:
+                    raise RunnerError(f"CONCURRENT_SLOT_EXHAUSTED: {profile or 'default'} "
+                                      f"has {held_count + jobs_count}/{admission_limit} held slots")
             con.execute(f"INSERT INTO jobs ({fields}) VALUES ({markers})", tuple(row.values()))
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
 
     def update(self, job_id: str, **fields: str) -> None:
         if not fields:

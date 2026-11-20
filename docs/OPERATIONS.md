@@ -1,79 +1,45 @@
-# Operations runbook — troubleshooting and recovery
+# Operations and recovery
 
-This runbook is based on current `kgr` behavior at `cff2a661a3e6357febd9c574158fd58d020781ac`. It distinguishes local state from the authoritative Kaggle service.
+## Credentials and preflight
 
-## Routine preflight
+Use private project-root `.env` for team credentials unless `--env-file` or `KGR_ENV_FILE` selects a protected file. `kgr team diagnose` checks local syntax and key presence only; `kgr team check` calls Kaggle for each profile. Never display tokens or copy them into specs, notebooks, logs or reports. Do not rely on default account selection to widen a spec's `authorization.allowed_profiles`.
 
-```bash
-kgr team diagnose
-kgr team list
-kgr team check --gpu t4x2 --required-gpu-hours 2 --json
-```
+Preflight is a point-in-time check, not a Kaggle reservation. Kaggle controls actual capacity. CPU and GPU jobs share the local slot count per account alias. Agent and legacy admissions serialize within a shared `jobs.sqlite3`; separate machines do not coordinate.
 
-`team diagnose` validates selected `.env` structure **not** live credentials. `team check` calls Kaggle API independently for each profile and checks local tracked jobs. It can fail if a token is rejected, a profile lacks enough GPU hours, or there are two local active CPU/GPU jobs.
+## Recovery after interruption
 
-## `INCOMPLETE` team profile
-
-- Verify `KGR_TEAM_PROFILES` includes the intended exact alias, separated by commas.
-- Expected keys are `KGR_TEAM_<NORMALIZED_ALIAS>_USERNAME` and `_API_TOKEN`. For alias `hggggv`, prefix is `KGR_TEAM_HGGGGV_`; for `toan_ltv`, prefix is `KGR_TEAM_TOAN_LTV_`.
-- Use `kgr team diagnose`; inspect *key names only* if necessary, never print token values.
-- Check `KGR_ENV_FILE` override and selected `.env` path. If the file is correct but hand-edited lines aren't recognized, run `kgr team add ALIAS --username USER --replace` to rewrite them canonically; remove stale unused key pairs manually after backup.
-- `team add` does not auto-delete unrelated `.env` variables.
-
-## `.env` permission error
-
-`kgr` rejects symlinked/overly permissive credential files. On POSIX use `chmod 600 .env`, but confirm filesystem semantics (WSL DrvFs may require `metadata`). Do not turn off protection to silence warnings.
-
-## Running jobs are miscounted
+For an agent attempt, first inspect persisted records:
 
 ```bash
-kgr jobs --json
-kgr team check --gpu cpu --json
-kgr status JOB_ID --json
+kgr experiment show EXPERIMENT_ID --json
+kgr reconcile --experiment-id EXPERIMENT_ID --json
 ```
 
-- One GPU and one CPU job on **the same profile** count as 2/2 by local policy; the third attempt is blocked.
-- Completed/failed/cancelled jobs free tracked slots after refresh.
-- `CANCEL_ACKNOWLEDGED` on an old notebook is ambiguous and does not prove a live allocation. If Kaggle Active Events shows zero sessions but the notebook history returns old cancellation statuses, separate historical state from real active sessions.
-- Interactive jobs, other machines and direct website submissions may be invisible to fast tracked preflight.
-- For the default/legacy account only, `kgr active --remote --strict` offers a slow, best-effort history scan; it still cannot guarantee Kaggle slot availability.
+`submission.json` records `not_pushed` before staging, `submission_unknown` at the durable push boundary, or `remote_confirmed` after a successful response. A crash after the unknown marker requires reconciliation. A local job ID alone is not evidence that Kaggle created a kernel. `manual_review` or `ok: false` requires operator action under the original account; do not push again, switch accounts or release the lease based on timeout/expiry.
 
-## Stale notebook reference / access denied
-
-If an old Job ID points to `old_owner/slug` and the actual URL is `new_owner/slug`, verify the actual Kaggle URL and authenticated account. `kgr repair JOB_ID --owner new_owner` changes the local reference but **does not validate remote access**. `kgr status JOB_ID` checks the new ref. Avoid modifying slug to a different notebook. For inaccessible history which is independently confirmed inactive, `kgr archive JOB_ID --confirm-inactive` excludes it from local slot counts. Never archive simply because status lookup failed while a remote run may still exist.
-
-## Ambiguous submit failure / timeout
-
-A `kgr run` failure does not always prove nothing was created remotely. Before any retry:
+When remote visibility is confirmed, continue the same experiment:
 
 ```bash
-kgr jobs --json
-kgr show JOB_ID --json
-kgr status JOB_ID --json
+kgr experiment resume EXPERIMENT_ID --wait --max-wait-minutes 45 --json
 ```
 
-If the Job ID is unknown or status unavailable, check Kaggle kernels and canonical URLs under the authorized profile. Record reconciliation outcome in your run notes. **There is no automatic idempotent retry today.** Do not create another run until duplication risk is addressed.
+Resume may fetch outputs and validate results. For status lookup errors, inaccessible kernels, changed ownership or unknown status, stop for operator review. Do not interpret Kaggle `COMPLETE` as scientific success.
 
-## Remote kernel completed, artifacts missing
+## Result and artifact failures
+
+Check the result and artifacts:
 
 ```bash
-kgr status JOB_ID --json
-kgr logs JOB_ID --json
-kgr outputs JOB_ID --json
-kgr fetch JOB_ID --output ./results/JOB_ID --json
+kgr results validate JOB_ID --json
+kgr results aggregate --experiment-id EXPERIMENT_ID --json
 ```
 
-Inspect Kaggle logs, remote output list and input mounts. `kgr` can download artifacts, but the experiment must write expected files (normally into `/kaggle/working`). A Kaggle `COMPLETE` status is not enough for a scientific PASS: validate your own output schema, job identity, dataset split and metrics.
+Missing, malformed, empty, inconsistent or hash-mismatched data invalidates scientific success. Preserve downloaded evidence and resolve source, protocol, expected output or kernel problems before planning a new distinct attempt. Never rewrite a failed attempt's history.
 
-## Two-account smoke test fails
+## Legacy `kgr run`
 
-```bash
-python examples/team-env-multi-account/run_live_test.py \
-  --accounts alice bob --gpu cpu --confirm-live
-```
+Legacy jobs participate in atomic local slot admission and shared history, but they do not use immutable experiment attempts or the agent reconciliation contract. An ambiguous submit failure can leave a remote kernel. Use `kgr jobs`, `kgr show`, `kgr status` and the original profile to investigate; never assume retry is safe.
 
-This is opt-in and creates two real kernels. If one submission completes and the other fails, use saved Job IDs and `kgr status`/`fetch` for recovery; do not automatically re-submit both. Check each account's individual token/username, quota and Kaggle notebook permissions.
+## Operator incident notes
 
-## Recommended incident record
-
-Write a safe incident note: timestamp, Job ID, profile alias/owner, command (without token), exit code, redacted error, local state, remote observed state, affected artifacts, human decision and next check. Distinguish observed facts from assumptions. No token or `.env` contents should be included.
+Record timestamp, job and experiment/attempt IDs, profile alias, command without credentials, exit code, redacted error, local state, observed remote state, artifact hashes and the human decision. Keep assumptions separate from observed facts. Live tests and destructive recovery actions require separate explicit authorization.

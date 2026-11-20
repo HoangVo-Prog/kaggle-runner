@@ -268,58 +268,10 @@ def _team_statuses(settings, store: JobStore, *, gpu: str, hours: float, limit: 
 
 def dispatch(a: argparse.Namespace) -> int:
     settings = build_settings(state_dir=a.state_dir, profile=a.profile, config=a.config)
-    if a.command in {"package", "experiment", "reconcile", "results"} or (a.command == "report" and a.report_target):
-        from . import agent_workflow as agent
-        from .source_contract import inspect_source
-        if a.command == "package":
-            _emit(inspect_source(a.source, root=a.root, entry=a.entry,
-                                 max_mb=a.max_source_mb, include=a.include,
-                                 exclude=a.exclude))
-            return 0
-        if a.command == "experiment":
-            if a.experiment_command == "validate":
-                _emit(agent.validate(a.spec_file))
-            elif a.experiment_command == "submit":
-                _emit(agent.submit(a.spec_file, settings=settings, env_file=a.env_file,
-                                   account=a.account, approve=a.approve))
-            elif a.experiment_command == "show":
-                _emit(agent.show(settings, a.experiment_id))
-            else:
-                outcome = agent.resume(settings, a.experiment_id, env_file=a.env_file,
-                                       wait=a.wait, poll_seconds=a.poll_seconds,
-                                       max_wait_minutes=a.max_wait_minutes)
-                _emit(outcome)
-                return 0 if outcome["ok"] else 3
-            return 0
-        if a.command == "reconcile":
-            _emit(agent.reconcile(settings, a.env_file, a.experiment_id))
-            return 0
-        if a.command == "results":
-            if a.results_command == "validate":
-                outcome = agent.validate_result(settings, a.job_id)
-            else:
-                outcome = agent.aggregate(settings, a.experiment_id)
-            _emit(outcome)
-            return 0 if outcome["ok"] else 3
-        if a.command == "report":
-            if not a.report_experiment_id:
-                raise RunnerError("report experiment requires EXPERIMENT_ID")
-            outcome = agent.report(settings, a.report_experiment_id, format=a.format)
-            evidence = agent.evidence_bundle(settings, a.report_experiment_id)
-            if a.format == "md" and not _JSON_OUTPUT.get():
-                print(
-                    outcome
-                    + "\n## Evidence bundle\n"
-                    + f"- SHA256: `{evidence['sha256']}`\n"
-                    + f"- Path: `{evidence['bundle_path']}`\n"
-                )
-            else:
-                if isinstance(outcome, dict):
-                    outcome["evidence"] = evidence
-                    _emit(outcome)
-                else:
-                    _emit({"report": outcome, "evidence": evidence})
-            return 0
+    from .commands.agent import dispatch_agent_command
+    agent_code = dispatch_agent_command(a, settings, _emit, json_output=_JSON_OUTPUT.get())
+    if agent_code is not None:
+        return agent_code
     # Team profiles are self-contained and must never depend on, or accidentally
     # load, credentials from an unrelated single-account .env in the checkout.
     uses_team = a.command == "team" or (a.command == "run" and bool(a.account))
@@ -508,7 +460,8 @@ def dispatch(a: argparse.Namespace) -> int:
                             model_refs=a.model, notebook_file=notebook_file,
                             account_profile=selected_profile.alias if selected_profile else None,
                             account_owner=owner,
-                            account_email=selected_profile.email if selected_profile else account.email)
+                            account_email=selected_profile.email if selected_profile else account.email,
+                            max_concurrent=a.max_concurrent)
         _emit(result)
         if a.wait:
             job_id = result["job_id"]
