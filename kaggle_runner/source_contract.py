@@ -220,6 +220,7 @@ def _make_zip(items: list[tuple[str, bytes]]) -> bytes:
 def stage_agent_notebook(source: Path, target: Path, *, root: Path, entry: str,
                          datasets: list[str], models: list[str], install_requirements: bool = False,
                          experiment_id: str = "", attempt_id: str = "", parameters: dict | None = None,
+                         seed: int | None = None,
                          expected_result: str = "result.json", max_bytes: int = MAX_BUNDLE_BYTES,
                          include: list[str] | None = None,
                          exclude: list[str] | None = None) -> list[dict]:
@@ -257,6 +258,7 @@ os.environ['KGR_OUTPUT_DIR'] = '/kaggle/working'
 os.environ['KGR_DATASET_ROOT'] = '/kaggle/input'
 os.environ['KGR_EXPERIMENT_ID'] = {experiment_id!r}
 os.environ['KGR_ATTEMPT_ID'] = {attempt_id!r}
+os.environ['KGR_SEED'] = {str(seed if seed is not None else '')!r}
 os.environ['KGR_PARAMETERS_JSON'] = {params!r}
 os.environ['KGR_RESULT_FILENAME'] = {expected_result!r}
 os.environ['KGR_SOURCE_SHA256'] = {source_digest!r}

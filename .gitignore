@@ -25,6 +25,7 @@ examples/config.toml
 *.sqlite3-*
 setup-checkpoint.json
 setup-checkpoint.json.lock
+/work/
 gpu-smoke-results/
 /data/
 /datasets/

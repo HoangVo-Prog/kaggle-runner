@@ -22,6 +22,30 @@ Example: a first session sees `checkpoint_status: missing`, then runs `kgr setup
 
 The checkpoint is under the selected `Settings.state` (`KGR_STATE_DIR` or `--state-dir`). `setup status` is read-only. Verification writes the checkpoint atomically and keeps history; it does not install packages, create credentials, or create/reset `jobs.sqlite3`. A corrupt checkpoint is preserved for operator review.
 
+## Persistent research objectives
+
+Objective checkpoints extend the same `jobs.sqlite3`; they do not copy or invent experiment/job states. The agent ledger remains authoritative for remote state and scientifically validated results. Work rows use append-only events, revision checks, and stable objective/experiment/attempt IDs. Specs are saved as immutable snapshots under the selected state directory.
+
+```bash
+kgr work create --title "Notebook evaluation" \
+  --acceptance-criterion "All validated runs use the pinned protocol" \
+  --authorized-profile alice --json
+kgr work show OBJECTIVE_ID --json
+kgr work plan OBJECTIVE_ID --file plan.json --expected-revision 1 --json
+kgr work approve OBJECTIVE_ID --expected-revision 2 --json
+kgr work execute OBJECTIVE_ID --account auto --wait --json
+kgr work show OBJECTIVE_ID --json
+kgr work report OBJECTIVE_ID --format md
+```
+
+`plan.json` may contain one immutable `template` ExperimentSpec plus a unique `seeds` array, or an `experiments` array of `{ "template": ExperimentSpec, "seeds": [...] }` entries for multiple scientific configurations. Each experiment ID must be unique; attempt IDs are stable within that experiment. Shared settings include `total_gpu_hours`, `planned_gpu_hours_per_attempt`, `max_concurrent` (1 or 2), and optional polling, timeout, approval, failure, partial-completion and checklist settings. An experiment entry may override the per-attempt GPU-hour estimate. For example, ten seeds with a 0.5 GPU-hour estimate each require an approved total budget of at least 5 GPU-hours. Planning pins the inspected source SHA into each per-seed spec and rejects plans outside the objective profile allowlist or budget. Each submit uses the existing fresh preflight and atomic per-account lease; quota/slot errors stop the batch. `--wait` uses the existing reconcile, fetch and scientific-result validation lifecycle for every experiment represented in each bounded batch.
+
+If execution is interrupted, use `kgr work show OBJECTIVE_ID --json`, reconcile linked experiments, then rerun `kgr work execute OBJECTIVE_ID --wait`. Existing attempt IDs are never submitted again. `unknown_remote`, failed attempts, changed snapshots and inaccessible kernels require operator review. The objective remains `needs_review` or `blocked`; completion requires all checklist steps and evidence for every acceptance criterion. Use `kgr work complete OBJECTIVE_ID --expected-revision N --acceptance-review-json '[...]'` only after checking the authoritative attempt results. Objective reports include each experiment's authoritative aggregation statistics and excluded attempts, and are content-addressed under `Settings.state/work/OBJECTIVE_ID/reports/`.
+
+`KGR_SEED` is injected into both script and notebook runtime environments. It corresponds to the top-level ExperimentSpec seed and the result validator checks that value. Aggregation compares invariant source, protocol, dataset/model references, metric definition and parameters while allowing distinct attempt seeds. Offline fake-provider tests cover planning and bounded execution; real Kaggle quota, remote behavior and artifact fetching remain unverified here.
+
+The objective shows observed GPU-hours only when validated result metadata includes runtime. This is a runtime-derived estimate (T4x2 multiplies runtime by two devices), not Kaggle's quota ledger; unknown usage remains `null`. With `--wait`, before each later batch the executor compares that estimate plus remaining planned estimates to the approved total and stops if it would exceed the budget.
+
 ## Credentials and preflight
 
 Use private project-root `.env` for team credentials unless `--env-file` or `KGR_ENV_FILE` selects a protected file. `kgr team diagnose` checks local syntax and key presence only; `kgr team check` calls Kaggle for each profile. Never display tokens or copy them into specs, notebooks, logs or reports. Do not rely on default account selection to widen a spec's `authorization.allowed_profiles`.

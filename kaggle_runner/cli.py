@@ -84,6 +84,52 @@ def parser() -> argparse.ArgumentParser:
     verify_mode.add_argument("--offline", action="store_true", help="Verify local prerequisites and stale source tests")
     verify_mode.add_argument("--online", action="store_true", help="Also perform one read-only authentication check")
     verify_setup.add_argument("--account", help="Explicit profile alias for --online; no auto selection")
+
+    work = sub.add_parser("work", help="Create and resume persistent research objectives")
+    work_sub = work.add_subparsers(dest="work_command", required=True)
+    w_create = work_sub.add_parser("create", help="Create a durable research objective")
+    w_create.add_argument("--title", required=True)
+    w_create.add_argument("--description", default="")
+    w_create.add_argument("--acceptance-criterion", action="append", default=[])
+    w_create.add_argument("--objective-id")
+    w_create.add_argument("--authorized-profile", action="append", default=[])
+    w_list = work_sub.add_parser("list", help="List saved objectives")
+    w_list.add_argument("--active", action="store_true")
+    for subcommand in ("show", "status", "resume"):
+        work_sub.add_parser(subcommand).add_argument("objective_id")
+    w_execute = work_sub.add_parser("execute", help="Submit a bounded batch through experiment preflight and leases")
+    w_execute.add_argument("objective_id")
+    w_execute.add_argument("--account", default="auto", help="Profile alias or auto constrained by the plan allowlist")
+    w_execute.add_argument("--approve", action="store_true", help="Approve ExperimentSpec submissions that require it")
+    w_execute.add_argument("--wait", action="store_true", help="Reconcile, fetch and validate each bounded batch before continuing")
+    w_execute.add_argument("--poll-seconds", type=int)
+    w_execute.add_argument("--max-wait-minutes", type=int)
+    w_plan = work_sub.add_parser("plan", help="Validate and persist an immutable experiment plan")
+    w_plan.add_argument("objective_id")
+    w_plan.add_argument("--file", required=True)
+    w_plan.add_argument("--expected-revision", type=int, required=True)
+    w_checkpoint = work_sub.add_parser("checkpoint", help="Record a validated checklist step and evidence")
+    w_checkpoint.add_argument("objective_id")
+    w_checkpoint.add_argument("--step", required=True)
+    w_checkpoint.add_argument("--status", choices=("todo", "in_progress", "done", "blocked", "skipped", "stale"), required=True)
+    w_checkpoint.add_argument("--expected-revision", type=int, required=True)
+    w_checkpoint.add_argument("--evidence-json", help="JSON array of evidence records; never include secrets")
+    w_approve = work_sub.add_parser("approve", help="Explicitly approve a persisted plan")
+    w_approve.add_argument("objective_id")
+    w_approve.add_argument("--expected-revision", type=int, required=True)
+    w_pause = work_sub.add_parser("pause", help="Pause an objective with an auditable reason")
+    w_pause.add_argument("objective_id")
+    w_pause.add_argument("--expected-revision", type=int, required=True)
+    w_pause.add_argument("--reason", required=True)
+    w_complete = work_sub.add_parser("complete", help="Complete only after criterion evidence is reviewed")
+    w_complete.add_argument("objective_id")
+    w_complete.add_argument("--expected-revision", type=int, required=True)
+    w_complete.add_argument("--acceptance-review-json", required=True,
+                             help="JSON array mapping each acceptance criterion to evidence")
+    w_report = work_sub.add_parser("report", help="Render objective-level evidence report")
+    w_report.add_argument("objective_id")
+    w_report.add_argument("--format", choices=("md",), default="md")
+
     check = sub.add_parser("check", help="Check running batch kernels and GPU quota before submit")
     check.add_argument("--gpu", choices=("cpu", "t4x2"), default="t4x2")
     check.add_argument("--required-gpu-hours", type=float, default=0.25)
@@ -290,6 +336,49 @@ def dispatch(a: argparse.Namespace) -> int:
                                              online_account=a.account if a.online else None)
         _emit(outcome)
         return 0 if outcome["ok"] else 3
+    if a.command == "work":
+        from . import work_checkpoint
+        if a.work_command == "create":
+            outcome = work_checkpoint.create(settings, title=a.title, description=a.description,
+                acceptance=a.acceptance_criterion, objective_id=a.objective_id,
+                authorized_profiles=a.authorized_profile)
+        elif a.work_command == "list":
+            outcome = work_checkpoint.list_work(settings, active=a.active)
+        elif a.work_command == "show":
+            outcome = work_checkpoint.show(settings, a.objective_id)
+        elif a.work_command == "status":
+            outcome = work_checkpoint.status(settings, a.objective_id)
+        elif a.work_command == "resume":
+            outcome = work_checkpoint.resume(settings, a.objective_id)
+        elif a.work_command == "execute":
+            outcome = work_checkpoint.execute(settings, a.objective_id, env_file=a.env_file,
+                                             account=a.account, approve=a.approve, wait=a.wait,
+                                             poll_seconds=a.poll_seconds, max_wait_minutes=a.max_wait_minutes)
+        elif a.work_command == "plan":
+            outcome = work_checkpoint.plan(settings, a.objective_id, a.file, expected_revision=a.expected_revision)
+        elif a.work_command == "checkpoint":
+            evidence = json.loads(a.evidence_json) if a.evidence_json else []
+            if not isinstance(evidence, list):
+                raise RunnerError("--evidence-json must be a JSON array")
+            outcome = work_checkpoint.checkpoint(settings, a.objective_id, a.step,
+                expected_revision=a.expected_revision, step_status=a.status, evidence=evidence)
+        elif a.work_command == "approve":
+            outcome = work_checkpoint.approve(settings, a.objective_id, expected_revision=a.expected_revision)
+        elif a.work_command == "pause":
+            outcome = work_checkpoint.pause(settings, a.objective_id,
+                expected_revision=a.expected_revision, reason=a.reason)
+        elif a.work_command == "complete":
+            review = json.loads(a.acceptance_review_json)
+            outcome = work_checkpoint.complete(settings, a.objective_id,
+                expected_revision=a.expected_revision, acceptance_review=review)
+        else:
+            outcome = work_checkpoint.report(settings, a.objective_id)
+            if not _JSON_OUTPUT.get():
+                print(outcome)
+                return 0
+            outcome = {"report": outcome}
+        _emit(outcome)
+        return 0 if outcome.get("ok", True) else 3
     from .commands.agent import dispatch_agent_command
     agent_code = dispatch_agent_command(a, settings, _emit, json_output=_JSON_OUTPUT.get())
     if agent_code is not None:

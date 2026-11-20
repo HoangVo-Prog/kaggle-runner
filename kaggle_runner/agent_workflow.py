@@ -260,6 +260,7 @@ def submit(spec_file: str | Path, *, settings: Settings, env_file: str | None = 
             max_concurrent=spec.get("resources", {}).get("max_concurrent", 2),
             job_id=job_id, experiment_id=exp, attempt_id=attempt,
             parameters=spec.get("parameters", {}),
+            seed=spec["seed"],
             expected_source_sha256=inspected["source_sha256"],
             expected_result=inspected["result_file"],
             source_include=spec["source"].get("include"),

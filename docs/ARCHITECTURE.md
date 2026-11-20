@@ -9,6 +9,7 @@ kgr CLI (cli.py)
   ├─ experiments/results.py ─ scientific result and artifact validation
   ├─ commands/agent.py ─ package/experiment/results/report CLI handlers
   ├─ agent_ledger.py ─── agent attempts, append-only events and local leases
+  ├─ work_checkpoint.py ─ objective plans, checklist evidence and orchestration handoff
   ├─ runner.py ───────── staging, Kaggle push, status and artifact fetch
   ├─ source_contract.py / packaging.py / notebooks.py ─ source inspection/runtime
   ├─ preflight.py ────── local activity and Kaggle resource checks
@@ -28,6 +29,8 @@ This is the current ownership map. `agent_workflow.validate_result` remains as a
 Agent attempts and legacy job rows share `jobs.sqlite3`. Agent reservation transactions count held agent leases plus active legacy rows, and legacy `JobStore.add(..., admission_limit=...)` takes `BEGIN IMMEDIATE` and counts held agent leases plus active legacy rows before inserting its prepared row. Exact account aliases are used (`NULL` is the default account). Competing legacy and agent submissions therefore serialize at local admission when they use the same database. A confirmed remote terminal state releases the agent lease. Expired leases remain held until reconciliation; expiry alone is not evidence that remote compute ended.
 
 The machine-local `setup-checkpoint.json` is stored beside `jobs.sqlite3` under `Settings.state`. It records versioned local checks and an append-only verification history, never experiment state or credentials. Atomic replace plus a sidecar lock preserves concurrent verification history. Checkpoint corruption is reported and never overwritten automatically. `setup status` reads SQLite in read-only mode and never queries Kaggle; online auth success is stored separately from local readiness and becomes stale after 24 hours or credential metadata changes.
+
+Work objectives add `work_objectives`, `work_steps`, `work_events` and `work_attempt_links` to that same database through additive migrations. Attempt links contain stable identifiers and immutable spec paths/hashes only; remote state, leases, validation and results are joined from `agent_attempts` on read. Revision-checked objective changes serialize under `BEGIN IMMEDIATE`. The foreground executor submits bounded groups through `agent_workflow.submit`, which performs a fresh preflight and reservation for every attempt, and uses the existing resume path for reconciliation/fetch/validation when `--wait` is selected.
 
 ## Boundaries
 

@@ -35,7 +35,8 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                account_profile: str | None = None, account_owner: str | None = None,
                account_email: str | None = None, job_id: str | None = None,
                experiment_id: str = "", attempt_id: str = "",
-               parameters: dict | None = None, expected_source_sha256: str | None = None,
+               parameters: dict | None = None, seed: int | None = None,
+               expected_source_sha256: str | None = None,
                expected_result: str = "result.json",
                source_include: list[str] | None = None,
                source_exclude: list[str] | None = None,
@@ -79,7 +80,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
         files = stage_notebook(npath, staging / code_file, refs, models,
                                root=src, entry=entry, install_requirements=install_requirements,
                                experiment_id=experiment_id, attempt_id=attempt_id,
-                               parameters=parameters, expected_result=expected_result,
+                               parameters=parameters, seed=seed, expected_result=expected_result,
                                max_bytes=max_source_mb * 1024 * 1024,
                                include=source_include, exclude=source_exclude)
     else:
@@ -88,7 +89,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                         datasets=refs, install_requirements=install_requirements,
                         unpack_datasets=unpack_datasets, models=models,
                         experiment_id=experiment_id, attempt_id=attempt_id,
-                        parameters=parameters, expected_result=expected_result,
+                        parameters=parameters, seed=seed, expected_result=expected_result,
                         source_sha256=source_hash(files)), encoding="utf-8")
     # Immutable source check after staging, before any remote push.
     frozen_source_sha256 = source_hash(files)
@@ -104,7 +105,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     (staging / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     manifest = {"job_id": job_id, "kernel_ref": kernel_ref, "source": source,
                 "revision": revision, "entry": entry, "kernel_type": kernel_type, "gpu": gpu,
-                "experiment_id": experiment_id, "attempt_id": attempt_id,
+                "experiment_id": experiment_id, "attempt_id": attempt_id, "seed": seed,
                 "source_sha256": frozen_source_sha256, "parameters": parameters or {},
                 "dataset_refs": refs, "model_refs": models, "files": files, "account_profile": account_profile, "account_owner": account_owner,
                 "account_email": account_email, "source_zip_sha256": hashlib.sha256(data).hexdigest() if data else None,

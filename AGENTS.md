@@ -2,7 +2,14 @@
 
 `kgr` is a local CLI for packaging and running Kaggle kernels. The agent workflow is implemented as a CLI lifecycle, not as a resident scheduler or cross-machine coordinator. Read only the task guide needed:
 
-At the start of each new agent session, run `kgr setup status --json`. If the checkpoint is ready and current, reuse it; do not reinstall packages or recreate credentials. Run only the stale checks reported by status with `kgr setup verify --offline --json`, or perform an explicitly selected read-only auth check with `kgr setup verify --online --account ALIAS --json`.
+At the start of each new agent session, read this guide, then run:
+
+```bash
+kgr setup status --json
+kgr work list --active --json
+```
+
+Reuse a current setup checkpoint; do not reinstall packages or recreate credentials. Revalidate only stale setup checks. For a selected objective, run `kgr work show OBJECTIVE_ID --json`, reconcile every linked experiment that may have crossed the remote push boundary, then continue from its persisted `next_action`. Do not create a duplicate objective or attempt after a restart, repeat an ambiguous push, or treat checklist evidence as proof of remote state.
 
 - First setup and offline example: [docs/QUICKSTART.md](docs/QUICKSTART.md)
 - Full submit, recovery, result and report lifecycle: [docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md)

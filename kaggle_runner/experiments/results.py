@@ -152,6 +152,7 @@ def validate_result(settings: Settings, job_id: str, *, save: bool = True) -> di
               "job_id": job_id, "experiment_id": spec["experiment_id"],
               "attempt_id": spec["attempt_id"], "scientific_status": "valid" if not errors else "invalid",
               "primary_metric": spec["primary_metric"], "metrics": metrics,
+              "runtime_seconds": result.get("runtime_seconds") if isinstance(result, dict) else None,
               "artifact_inventory": artifact_inventory, "result_sha256": fingerprint,
               "errors": sorted(set(errors))}
     if save and attempt["state"] in {"remote_complete", "fetch_failed", "invalid_result", "succeeded"}:

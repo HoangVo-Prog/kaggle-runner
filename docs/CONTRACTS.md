@@ -21,6 +21,6 @@ Remote `COMPLETE` only establishes worker completion. It does not establish scie
 
 `kgr package inspect` and submit use the same deterministic source selector and exclusion rules. Python source is embedded in a bounded archive; notebooks preserve the original cell sequence in the staged copy and may include selected companion files. The original notebook is not modified. Review the package report before submitting.
 
-Both runtime modes receive `KGR_PARAMETERS_JSON`, `KGR_EXPERIMENT_ID`, `KGR_ATTEMPT_ID`, `KGR_SOURCE_SHA256` and `KGR_OUTPUT_DIR`. Write declared output files in that directory. Explicit dataset and model refs are mounted by Kaggle; local private data is not uploaded automatically. Installing requirements requires internet access in the spec.
+Both runtime modes receive `KGR_PARAMETERS_JSON`, `KGR_SEED`, `KGR_EXPERIMENT_ID`, `KGR_ATTEMPT_ID`, `KGR_SOURCE_SHA256` and `KGR_OUTPUT_DIR`. `KGR_SEED` is the top-level per-attempt ExperimentSpec seed; it stays separate from invariant hyperparameters in `KGR_PARAMETERS_JSON`, and the validated result must report the same seed. Write declared output files in `KGR_OUTPUT_DIR`. Explicit dataset and model refs are mounted by Kaggle; local private data is not uploaded automatically. Installing requirements requires internet access in the spec.
 
 Schemas and validator are implemented and offline tested. Actual Kaggle mount paths, package install behavior and output fetches are unverified until a separately authorized live test.

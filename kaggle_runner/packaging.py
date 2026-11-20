@@ -194,6 +194,7 @@ output = pathlib.Path("/kaggle/working")
 result_path = output / "kgr_run_result.json"
 os.environ["KGR_EXPERIMENT_ID"] = _OPTIONS.get("experiment_id", "")
 os.environ["KGR_ATTEMPT_ID"] = _OPTIONS.get("attempt_id", "")
+os.environ["KGR_SEED"] = str(_OPTIONS.get("seed", ""))
 os.environ["KGR_PARAMETERS_JSON"] = json.dumps(_OPTIONS.get("parameters", {}), sort_keys=True)
 os.environ["KGR_RESULT_FILENAME"] = _OPTIONS.get("expected_result", "result.json")
 os.environ["KGR_SOURCE_SHA256"] = _OPTIONS.get("source_sha256", "")
@@ -280,10 +281,12 @@ def make_bootstrap(bundle: bytes, *, entry: str, arguments: list[str], datasets:
                    install_requirements: bool, unpack_datasets: bool = False,
                    models: list[str] | None = None, experiment_id: str = "",
                    attempt_id: str = "", parameters: dict | None = None,
+                   seed: int | None = None,
                    expected_result: str = "result.json",
                    source_sha256: str = "") -> str:
     options = {"entry": entry, "arguments": arguments, "datasets": datasets, "models": models or [],
                "experiment_id": experiment_id, "attempt_id": attempt_id,
+               "seed": seed,
                "parameters": parameters or {}, "expected_result": expected_result,
                "source_sha256": source_sha256,
                "install_requirements": install_requirements, "unpack_datasets": unpack_datasets}
