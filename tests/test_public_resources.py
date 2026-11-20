@@ -92,7 +92,7 @@ class PublicResourcesTests(unittest.TestCase):
         data, _ = pack_source(ROOT / "examples" / "public-resources", "inspect_resources.py", 2_000_000)
         script = make_bootstrap(data, entry="inspect_resources.py", arguments=[], datasets=[DATA],
                                 models=[MODEL], install_requirements=False)
-        script = script.replace("/kaggle/working", str(working)).replace("/kaggle/input", str(fake / "input"))
+        script = script.replace("/kaggle/working", working.as_posix()).replace("/kaggle/input", (fake / "input").as_posix())
         path = self.root / "run.py"
         path.write_text(script, encoding="utf-8")
         result = subprocess.run([sys.executable, str(path)], text=True, capture_output=True)
@@ -100,7 +100,7 @@ class PublicResourcesTests(unittest.TestCase):
         payload = json.loads((working / "public_resources_report.json").read_text())
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["dataset_rows"], 2)
-        self.assertTrue(payload["model_path"].endswith("/tensorflow2/130-224-classification/1"))
+        self.assertTrue(payload["model_path"].replace("\\", "/").casefold().endswith("/tensorflow2/130-224-classification/1"))
         self.assertTrue((working / "iris_species_counts.csv").exists())
         self.assertEqual(json.loads((working / "kgr_run_result.json").read_text())["status"], "ok")
 
@@ -112,7 +112,7 @@ class PublicResourcesTests(unittest.TestCase):
                                 entry="inspect_resources.py", arguments=[], datasets=[DATA],
                                 models=[MODEL], install_requirements=False)
         path = self.root / "run.py"
-        path.write_text(script.replace("/kaggle/working", str(fake / "working")).replace("/kaggle/input", str(fake / "input")))
+        path.write_text(script.replace("/kaggle/working", (fake / "working").as_posix()).replace("/kaggle/input", (fake / "input").as_posix()))
         result = subprocess.run([sys.executable, str(path)], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         report = json.loads((fake / "working" / "kgr_run_result.json").read_text())

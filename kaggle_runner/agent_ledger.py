@@ -14,13 +14,10 @@ from pathlib import Path
 from typing import Iterator
 
 from .config import RunnerError
+from .jobs import ACTIVE_JOB_STATES
 
 SCHEMA_VERSION = "1.0"
-ACTIVE_LEGACY = (
-    "prepared", "submitting", "submitted", "pending", "queued", "running",
-    "initializing", "starting", "cancel_requested", "cancel_acknowledged",
-    "status_unavailable", "unknown", "unknown_remote", "new_script",
-)
+ACTIVE_LEGACY = ACTIVE_JOB_STATES
 ALLOWED = {
     "reserved": {"staging", "blocked", "unknown_remote"},
     "staging": {"submitting", "blocked", "unknown_remote"},

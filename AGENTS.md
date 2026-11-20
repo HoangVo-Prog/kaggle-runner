@@ -1,23 +1,50 @@
-# AGENTS.md — Kaggle Runner operational contract
+# Kaggle Runner agent guide
 
-**Scope:** candidate agent-first CLI added to baseline `main` at `c778a14b`. This contract distinguishes working candidate capabilities from unresolved P0 acceptance; it is not a claim of full production or live Kaggle verification.
+`kgr` is a local CLI for packaging and running Kaggle kernels. The agent workflow is implemented as a CLI lifecycle, not as a resident scheduler or cross-machine coordinator. Read only the task guide needed:
 
-## Mandatory safety rules
+## Resolve the executable before any command (mandatory)
 
-1. Read the chosen ExperimentSpec and confirm research objective, data sharing policy, resource cost and **explicit** `authorization.allowed_profiles`. `--account auto` must not expand authorization.
-2. Keep all tokens in private project-root `.env` / the existing Kaggle credential configuration. Do not read, echo, commit, include in notebook output, embed in specs or attach to remote kernels. Never copy tokens into reports.
-3. Use `kgr experiment ... --json` and check both the exit code and `ok`; a successful push is **not** a scientifically successful experiment.
-4. Inspect upload contents *before* push using `kgr package inspect` and `kgr experiment validate`. Verify file names, SHA256, entrypoint, companion modules, runtime parameters, explicit dataset/model refs and expected outputs. Reject unsafe source trees.
-5. Use only `kgr experiment submit` for agent-managed work. The legacy `kgr run` command is preserved but not yet fully bound to the new transactional lease contract; do not use it concurrently with unattended workers.
-6. After `submit`, persist `job_id`, `experiment_id`, `attempt_id`, account alias and remote kernel ref from the JSON response. Never infer remote success from the local job ID alone.
-7. If a push fails ambiguously, do **not** push again. Execute `kgr reconcile --experiment-id ID --json` under the original account and request operator review if remote existence cannot be proven.
-8. Use `kgr experiment resume ID --json` or bounded `--wait`, not a new submission. Fetch artifacts with the original account token and compare hashes.
-9. Require a versioned `result.json`, validate it with `kgr results validate JOB_ID --json`, then aggregate only compatible attempts with `kgr results aggregate`.
-10. Generate report and content-addressed evidence using `kgr report experiment ID --format md`. Preserve provenance, excluded runs, uncertainty and limitations. Do not invent metrics.
-11. Never automatically rotate accounts to evade Kaggle limits, archive history, cancel remote kernels, upload private datasets, release unknown_remote leases or rerun failed code without explicit approval.
-12. Existing team `.env` diagnostics (`kgr team diagnose/list/check`) remain available, but local reservations cover **only processes sharing the same jobs.sqlite3**. Platform capacity remains Kaggle's authority.
+Codex may run each command in a fresh shell with a different `PATH`. Never assume that `kgr` is available or that a prior `conda activate` persists. Resolve one working Kaggle Runner invocation at session startup and reuse it across **all** setup, work, experiment, and report commands.
 
-## Recommended deterministic command sequence
+1. Try `command -v kgr` and then `kgr --help`. Do not use it if it points to an unrelated or stale installation.
+2. Otherwise, try `python -m kaggle_runner --help` (or `python3 -m kaggle_runner --help`). A module invocation does not require the `kgr` console script to be on `PATH`.
+3. If there is an existing project virtual environment, try its **explicit** interpreter: `./.venv/bin/python -m kaggle_runner --help` (Linux/WSL) or `.venv\Scripts\python.exe -m kaggle_runner --help` (Windows).
+4. If Conda exists, inspect `conda env list` and choose an existing, confirmed project environment. Use `conda run -n ENV_NAME --no-capture-output python -m kaggle_runner --help`. For later commands, reuse that entire `conda run ... python -m kaggle_runner` prefix, or use the selected environment's absolute Python executable. Do not guess the environment name.
+5. Check the selected interpreter's identity and imported package path with `python -c 'import sys, kaggle_runner; print(sys.executable); print(kaggle_runner.__file__)'` (replace `python` with the **selected invocation's Python**, including `conda run` when used). Verify that it points to the intended environment and checkout.
+6. If nothing works, stop and report the attempted **non-sensitive** executable locations. Do not silently install packages, create a Conda environment, modify credentials, reset SQLite, or use a different machine.
+
+A WSL Conda environment is not automatically accessible to native Windows processes or a remote Codex container. Keep the same `KGR_STATE_DIR`/`--state-dir` and `KGR_ENV_FILE`/`--env-file` throughout an objective. Treat `kgr: command not found` as an environment-resolution issue, **not** as permission to repeat setup.
+
+## Agent session startup
+
+After resolving a valid invocation, run the following commands, replacing `kgr` with the resolved `python -m kaggle_runner` or `conda run ... python -m kaggle_runner` prefix whenever necessary:
+
+```bash
+kgr setup status --json
+kgr work list --active --json
+```
+
+Reuse a current setup checkpoint; do not reinstall packages or recreate credentials. Revalidate only stale setup checks. For a selected objective, run `kgr work show OBJECTIVE_ID --json`, reconcile every linked experiment that may have crossed the remote push boundary, then continue from its persisted `next_action`. Apply the resolved invocation to all such commands. Do not create a duplicate objective or attempt after a restart, repeat an ambiguous push, or treat checklist evidence as proof of remote state.
+
+- First setup and offline example: [docs/QUICKSTART.md](docs/QUICKSTART.md)
+- Full submit, recovery, result and report lifecycle: [docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md)
+- Command flags and JSON behavior: [docs/CLI_REFERENCE.md](docs/CLI_REFERENCE.md)
+- Schemas and packaging/runtime contracts: [docs/CONTRACTS.md](docs/CONTRACTS.md)
+- Credential, quota and incident handling: [docs/OPERATIONS.md](docs/OPERATIONS.md)
+- Module ownership and persisted state: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- All documentation: [docs/INDEX.md](docs/INDEX.md)
+
+## Safety boundaries
+
+1. Read the ExperimentSpec. Confirm objective, data-sharing policy, compute budget, explicit `authorization.allowed_profiles`, dataset/model refs and expected outputs. `--account auto` may choose only among that allowlist.
+2. Never expose credentials. Keep tokens in the private project-root `.env` or Kaggle's existing credential configuration. Do not put tokens in specs, notebooks, logs, reports, or remote kernels.
+3. Before a push, inspect the source with `kgr package inspect` and `kgr experiment validate`. Check names, hashes, entrypoint, companion files, runtime parameters, refs and outputs.
+4. For agent-managed work, use `kgr experiment submit`, then retain its `job_id`, `experiment_id`, `attempt_id`, account alias and kernel ref. Check both process exit status and JSON `ok`.
+5. Never repeat a push after timeout or other ambiguous outcome. Use `kgr reconcile --experiment-id ID --json`; `manual_review` and `ok: false` require operator intervention. Never infer remote existence from a local job ID.
+6. Resume with `kgr experiment resume ID --json` or bounded `--wait`. Fetch under the original account and validate artifact hashes and versioned `result.json` before aggregation/reporting.
+7. No automatic account rotation, remote cancellation/archive, unknown lease release, private data upload, or retry of failed experiment code. Stop for credential, quota, authorization, hash, access, schema, artifact or budget uncertainty.
+
+## Common commands
 
 ```bash
 kgr team diagnose
@@ -33,18 +60,4 @@ kgr results aggregate --experiment-id EXPERIMENT_ID --json
 kgr report experiment EXPERIMENT_ID --format md
 ```
 
-Use `kgr package inspect ./experiment.ipynb --json` for native notebook entrypoints. Notebook code reads `KGR_PARAMETERS_JSON`, and both formats write standardized scientific output to `KGR_OUTPUT_DIR`. For new runs use distinct `attempt_id` values rather than trying to clear old records.
-
-## Stop and request operator intervention
-
-Missing/invalid credentials, unauthorized profiles, quota/slot blocking, source-hash drift, suspected secrets in source, ambiguous remote submission, inaccessible remote kernel, schema mismatch, missing or inconsistent artifacts, destructive actions, compute exceeding approved budgets or scientifically invalid metrics. Do not silently downgrade any such failure to success.
-
-## Verification before completion claim
-
-```bash
-python -m unittest discover -s tests -v
-python -m unittest discover -s tests -p 'test_agent_first_p0.py' -v
-python -m unittest discover -s tests -p 'test_agent_workflow_p0.py' -v
-```
-
-Current code and limitations: [agent workflow](docs/AGENT_WORKFLOW_P0.md), [source packaging](docs/SOURCE_PACKAGING.md), [result contract](docs/RESULT_CONTRACT_AGENT.md), [recovery](docs/RECOVERY.md). Live tests require separate explicit approval and are not part of the offline test suite.
+`kgr run` remains for legacy callers. Agent and legacy jobs use the same atomic local admission count when they share `jobs.sqlite3`. Legacy runs still lack agent idempotency and recovery contracts; never retry an ambiguous legacy push. No real Kaggle jobs are part of offline verification.

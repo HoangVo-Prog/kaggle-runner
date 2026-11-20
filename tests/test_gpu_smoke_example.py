@@ -42,7 +42,7 @@ class SmokeExampleTests(unittest.TestCase):
             working = fake / "working"
             working.mkdir(parents=True)
             script_path = base / "run.py"
-            script_path.write_text(script.replace("/kaggle/working", str(working)).replace("/kaggle/input", str(fake / "input")))
+            script_path.write_text(script.replace("/kaggle/working", working.as_posix()).replace("/kaggle/input", (fake / "input").as_posix()))
             p = subprocess.run([sys.executable, str(script_path)], capture_output=True, text=True)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertEqual(json.loads((working / "kgr_run_result.json").read_text())["status"], "ok")

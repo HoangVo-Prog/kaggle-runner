@@ -111,7 +111,7 @@ class ActiveSpeedTests(unittest.TestCase):
             fake = FakeManyKernels(0)
             env_file = Path(directory) / ".env"
             write_account(str(env_file), "example", "example@example.org", "mock-token-for-tests")
-            argv = ["--env-file", str(env_file), "active", "--remote", "--json"]
+            argv = ["--state-dir", str(Path(directory) / "state"), "--env-file", str(env_file), "active", "--remote", "--json"]
             output, diagnostic = io.StringIO(), io.StringIO()
             with patch.object(KaggleCLI, "call", fake.call), \
                  redirect_stdout(output), redirect_stderr(diagnostic):

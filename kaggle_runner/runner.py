@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 from pathlib import Path
+import os
 
 from .api import KaggleCLI
 from .config import RunnerError, Settings
@@ -17,6 +18,14 @@ from .packaging import (make_bootstrap, pack_source, resolve_source,
                         slugify, validate_ref, validate_model_ref)
 
 
+def _submission_evidence(job_dir: Path, state: str) -> None:
+    """Persist push boundary evidence atomically before/after the remote side effect."""
+    path = job_dir / "submission.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps({"state": state}, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: str,
                entry: str, owner: str, gpu: str, dataset_refs: list[str], arguments: list[str],
                install_requirements: bool = False, enable_internet: bool = False,
@@ -26,10 +35,12 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                account_profile: str | None = None, account_owner: str | None = None,
                account_email: str | None = None, job_id: str | None = None,
                experiment_id: str = "", attempt_id: str = "",
-               parameters: dict | None = None, expected_source_sha256: str | None = None,
+               parameters: dict | None = None, seed: int | None = None,
+               expected_source_sha256: str | None = None,
                expected_result: str = "result.json",
                source_include: list[str] | None = None,
-               source_exclude: list[str] | None = None) -> dict:
+               source_exclude: list[str] | None = None,
+               on_submission_start=None, max_concurrent: int = 2) -> dict:
     if not owner:
         raise RunnerError("Kaggle username is not configured. Pass --owner with the username from your Kaggle profile URL, or set [runner].owner in config.toml (not your display name).")
     if not owner.replace("-", "").replace("_", "").isalnum():
@@ -47,6 +58,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     job_id = job_id or uuid.uuid4().hex
     job_dir = settings.state / "jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
+    _submission_evidence(job_dir, "not_pushed")
     src, revision = resolve_source(source, job_dir, ref=git_ref)
     # Native .ipynb kernels preserve notebook cells and outputs in Kaggle UI.
     if notebook_file:
@@ -68,7 +80,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
         files = stage_notebook(npath, staging / code_file, refs, models,
                                root=src, entry=entry, install_requirements=install_requirements,
                                experiment_id=experiment_id, attempt_id=attempt_id,
-                               parameters=parameters, expected_result=expected_result,
+                               parameters=parameters, seed=seed, expected_result=expected_result,
                                max_bytes=max_source_mb * 1024 * 1024,
                                include=source_include, exclude=source_exclude)
     else:
@@ -77,7 +89,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                         datasets=refs, install_requirements=install_requirements,
                         unpack_datasets=unpack_datasets, models=models,
                         experiment_id=experiment_id, attempt_id=attempt_id,
-                        parameters=parameters, expected_result=expected_result,
+                        parameters=parameters, seed=seed, expected_result=expected_result,
                         source_sha256=source_hash(files)), encoding="utf-8")
     # Immutable source check after staging, before any remote push.
     frozen_source_sha256 = source_hash(files)
@@ -93,7 +105,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     (staging / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     manifest = {"job_id": job_id, "kernel_ref": kernel_ref, "source": source,
                 "revision": revision, "entry": entry, "kernel_type": kernel_type, "gpu": gpu,
-                "experiment_id": experiment_id, "attempt_id": attempt_id,
+                "experiment_id": experiment_id, "attempt_id": attempt_id, "seed": seed,
                 "source_sha256": frozen_source_sha256, "parameters": parameters or {},
                 "dataset_refs": refs, "model_refs": models, "files": files, "account_profile": account_profile, "account_owner": account_owner,
                 "account_email": account_email, "source_zip_sha256": hashlib.sha256(data).hexdigest() if data else None,
@@ -106,7 +118,8 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                "status": "prepared", "profile": settings.profile,
                "account_profile": account_profile, "account_owner": account_owner,
                "account_email": account_email,
-               "staging_dir": str(staging), "output_dir": None, "last_message": None})
+               "staging_dir": str(staging), "output_dir": None, "last_message": None},
+              admission_limit=max_concurrent)
     manifest["staging_dir"] = str(staging)
     manifest["dry_run"] = dry_run
     if dry_run:
@@ -115,12 +128,18 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     command = ["kernels", "push", "-p", str(staging)]
     if timeout_seconds:
         command.extend(["-t", str(timeout_seconds)])
+    # Persist ambiguity before crossing the external side-effect boundary. A crash
+    # from here through the response is never safe to retry automatically.
+    _submission_evidence(job_dir, "submission_unknown")
+    if on_submission_start is not None:
+        on_submission_start()
     try:
         response = cli.call(*command)
     except RunnerError as exc:
         # An API timeout may occur after Kaggle accepted the push.
         store.update(job_id, status="unknown_remote" if experiment_id else "submit_failed",
                      last_message="Submission outcome uncertain" if experiment_id else str(exc)[-4000:])
+        _submission_evidence(job_dir, "submission_unknown")
         raise RunnerError(f"Job {job_id}: {exc}") from exc
     # Trust the canonical notebook URL printed by Kaggle, not a user-supplied owner alias.
     remote = re.search(r"https?://(?:www\.)?kaggle\.com/code/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)", response.text)
@@ -130,6 +149,7 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
         manifest["kernel_ref"] = kernel_ref
         (job_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     store.update(job_id, status="submitted", last_message=response.text[-4000:])
+    _submission_evidence(job_dir, "remote_confirmed")
     manifest["submit_output"] = response.text
     return manifest
 
