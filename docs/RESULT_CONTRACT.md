@@ -133,3 +133,8 @@ kgr report experiment smoke-2026-11-20-001 --format md
 ```
 
 Implement these only after versioned JSON schemas and validation tests exist. Until then, build a separate agent-side adapter that drives current `kgr` commands and validates known experiment-specific result files.
+
+
+## Implemented candidate contract
+
+See [ExperimentResult v1.0 validation](RESULT_CONTRACT_AGENT.md) and the executable JSON Schemas under repository `schemas/`. Scientific validation is distinct from Kaggle remote COMPLETE.

@@ -45,3 +45,8 @@ Treat the **implementation and tests** as authoritative for supported CLI flags,
 - Kaggle [Terms of Use](https://www.kaggle.com/terms).
 
 Do not confuse `kaggle quota` (compute GPU/TPU budget) with `kaggle benchmarks quota` (a separate model proxy quota). This repo is for notebook execution, not the Kaggle Benchmarks product.
+
+
+## Agent-first P0 candidate
+
+See [agent workflow](AGENT_WORKFLOW_P0.md), [source packaging](SOURCE_PACKAGING.md), [Python](PYTHON_EXPERIMENTS.md), [notebooks](NOTEBOOK_EXPERIMENTS.md), [authoring](EXPERIMENT_AUTHORING.md), [results](RESULT_CONTRACT_AGENT.md), [states](STATE_MACHINE.md), [recovery](RECOVERY.md) and [errors](ERROR_CODES.md).

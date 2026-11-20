@@ -90,3 +90,8 @@ A `--dry-run` creates local staging and a `prepared` record but never calls Kagg
 - No standardized experiment-spec version, dataset-content checksum enforcement, retry budget, lease/lock, event log, durable queue, notification, or result schema validation exists today.
 
 The [roadmap](ROADMAP_AGENT_FIRST.md) describes how to close these gaps without discarding the existing CLI.
+
+
+## Candidate agent-first modules
+
+`source_contract.py` selects and stages source; `agent_ledger.py` manages atomic SQLite attempts, leases and events; `agent_workflow.py` handles versioned specs, safe submission, read-only reconciliation, validation, aggregation and evidence reports. All are composed into the existing CLI; credentials remain account-scoped.

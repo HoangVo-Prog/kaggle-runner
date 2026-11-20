@@ -1,0 +1,60 @@
+{
+  "schema_version": "1.0",
+  "experiment_id": "cpu-smoke",
+  "attempt_id": "seed-42",
+  "project": "kgr-demo",
+  "objective": "Check deterministic CPU experiment submission and scientific result validation",
+  "source": {
+    "kind": "python",
+    "root": ".",
+    "entrypoint": "train.py",
+    "max_source_mb": 3,
+    "install_requirements": false,
+    "include": [
+      "*.py"
+    ],
+    "exclude": []
+  },
+  "parameters": {
+    "seed": 42,
+    "prediction": [
+      1,
+      0,
+      1,
+      0
+    ],
+    "gold": [
+      1,
+      0,
+      0,
+      0
+    ]
+  },
+  "seed": 42,
+  "protocol": {
+    "id": "smoke-v1",
+    "dataset_split": "validation"
+  },
+  "datasets": [],
+  "models": [],
+  "resources": {
+    "accelerator": "cpu",
+    "max_concurrent": 2,
+    "enable_internet": false
+  },
+  "authorization": {
+    "allowed_profiles": [
+      "alice"
+    ],
+    "requires_submit_approval": true
+  },
+  "expected_outputs": [
+    "result.json"
+  ],
+  "result_file": "result.json",
+  "primary_metric": {
+    "name": "accuracy",
+    "unit": "fraction",
+    "higher_is_better": true
+  }
+}

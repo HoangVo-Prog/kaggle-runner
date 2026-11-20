@@ -58,3 +58,8 @@ There is also an opt-in GPU/CPU slot-limit smoke documented in `examples/slot-li
 Before claiming AGENTS can fully manage experiments unattended, the project should demonstrate: (a) idempotent submission after process interruption, (b) atomic admission under concurrent workers, (c) explicit per-owner authorization, (d) versioned result schema validation, (e) consistent machine-readable error envelopes, (f) automatic resume/reconcile, and (g) end-to-end report generated from actual artifact values with traceable job/source metadata.
 
 Tests should run in CI in three tiers: offline unit/contract tests on each push; hermetic integration tests against a fake Kaggle API; optional manual/live integration with two authorized profiles. **Never run live Kaggle submissions on every PR** without explicit approval and resource budgeting.
+
+
+## Agent-first offline candidate regressions
+
+`python -m unittest discover -s tests -p 'test_agent_first_p0.py' -v` and `python -m unittest discover -s tests -p 'test_agent_workflow_p0.py' -v`. These cover source contracts, local SQLite races, idempotency, ambiguous remote outcomes and scientific output validation with mocks; they are not live Kaggle tests.

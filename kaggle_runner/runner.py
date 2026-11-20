@@ -11,6 +11,7 @@ from .api import KaggleCLI
 from .config import RunnerError, Settings
 from .jobs import JobStore
 from .notebooks import stage_notebook
+from .source_contract import source_hash
 from .status import parse_kernel_status
 from .packaging import (make_bootstrap, pack_source, resolve_source,
                         slugify, validate_ref, validate_model_ref)
@@ -23,7 +24,12 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
                git_ref: str | None = None, unpack_datasets: bool = False,
                model_refs: list[str] | None = None, notebook_file: str | None = None,
                account_profile: str | None = None, account_owner: str | None = None,
-               account_email: str | None = None) -> dict:
+               account_email: str | None = None, job_id: str | None = None,
+               experiment_id: str = "", attempt_id: str = "",
+               parameters: dict | None = None, expected_source_sha256: str | None = None,
+               expected_result: str = "result.json",
+               source_include: list[str] | None = None,
+               source_exclude: list[str] | None = None) -> dict:
     if not owner:
         raise RunnerError("Kaggle username is not configured. Pass --owner with the username from your Kaggle profile URL, or set [runner].owner in config.toml (not your display name).")
     if not owner.replace("-", "").replace("_", "").isalnum():
@@ -38,32 +44,45 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
         raise RunnerError("Only cpu and t4x2 are supported in P0")
     refs = list(dict.fromkeys(validate_ref(d, "dataset reference") for d in dataset_refs))
     models = list(dict.fromkeys(validate_model_ref(m) for m in (model_refs or [])))
-    job_id = uuid.uuid4().hex
+    job_id = job_id or uuid.uuid4().hex
     job_dir = settings.state / "jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
     src, revision = resolve_source(source, job_dir, ref=git_ref)
     # Native .ipynb kernels preserve notebook cells and outputs in Kaggle UI.
     if notebook_file:
         npath = Path(notebook_file).expanduser().resolve()
-        if npath.parent != src:
-            raise RunnerError("Notebook must be a direct file within the specified source directory")
+        if not npath.is_relative_to(src) or npath.relative_to(src).as_posix() != entry:
+            raise RunnerError("Notebook entrypoint must be a project-relative file")
         data, files = b"", []
     else:
-        data, files = pack_source(src, entry, max_source_mb * 1024 * 1024)
+        data, files = pack_source(src, entry, max_source_mb * 1024 * 1024,
+                                  include=source_include, exclude=source_exclude)
     slug = f"kgr-{slugify(src.name, 24)}-{job_id[:10]}"
     kernel_ref = validate_ref(f"{owner}/{slug}", "kernel reference")
     staging = job_dir / "kernel"
     staging.mkdir()
     if notebook_file:
-        if arguments or install_requirements or unpack_datasets:
-            raise RunnerError("Notebook mode does not support --arg/--install-requirements/--unpack-datasets; use notebook cells")
+        if arguments or unpack_datasets:
+            raise RunnerError("Notebook mode does not support --arg or --unpack-datasets; use KGR_PARAMETERS_JSON")
         kernel_type, code_file = "notebook", "run.ipynb"
-        files = stage_notebook(npath, staging / code_file, refs, models)
+        files = stage_notebook(npath, staging / code_file, refs, models,
+                               root=src, entry=entry, install_requirements=install_requirements,
+                               experiment_id=experiment_id, attempt_id=attempt_id,
+                               parameters=parameters, expected_result=expected_result,
+                               max_bytes=max_source_mb * 1024 * 1024,
+                               include=source_include, exclude=source_exclude)
     else:
         kernel_type, code_file = "script", "run.py"
         (staging / code_file).write_text(make_bootstrap(data, entry=entry, arguments=arguments,
                         datasets=refs, install_requirements=install_requirements,
-                        unpack_datasets=unpack_datasets, models=models), encoding="utf-8")
+                        unpack_datasets=unpack_datasets, models=models,
+                        experiment_id=experiment_id, attempt_id=attempt_id,
+                        parameters=parameters, expected_result=expected_result,
+                        source_sha256=source_hash(files)), encoding="utf-8")
+    # Immutable source check after staging, before any remote push.
+    frozen_source_sha256 = source_hash(files)
+    if expected_source_sha256 and frozen_source_sha256 != expected_source_sha256:
+        raise RunnerError("SOURCE_REVISION_MISMATCH: source changed between validation and packaging")
     metadata = {"id": kernel_ref, "title": slug.replace("-", " ").title(),
                 "code_file": code_file, "language": "python", "kernel_type": kernel_type,
                 "is_private": "true", "enable_gpu": "false", "enable_tpu": "false",
@@ -74,6 +93,8 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     (staging / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     manifest = {"job_id": job_id, "kernel_ref": kernel_ref, "source": source,
                 "revision": revision, "entry": entry, "kernel_type": kernel_type, "gpu": gpu,
+                "experiment_id": experiment_id, "attempt_id": attempt_id,
+                "source_sha256": frozen_source_sha256, "parameters": parameters or {},
                 "dataset_refs": refs, "model_refs": models, "files": files, "account_profile": account_profile, "account_owner": account_owner,
                 "account_email": account_email, "source_zip_sha256": hashlib.sha256(data).hexdigest() if data else None,
                 "source_zip_bytes": len(data), "arguments": arguments, "install_requirements": install_requirements,
@@ -97,7 +118,9 @@ def create_job(settings: Settings, cli: KaggleCLI, store: JobStore, *, source: s
     try:
         response = cli.call(*command)
     except RunnerError as exc:
-        store.update(job_id, status="submit_failed", last_message=str(exc)[-4000:])
+        # An API timeout may occur after Kaggle accepted the push.
+        store.update(job_id, status="unknown_remote" if experiment_id else "submit_failed",
+                     last_message="Submission outcome uncertain" if experiment_id else str(exc)[-4000:])
         raise RunnerError(f"Job {job_id}: {exc}") from exc
     # Trust the canonical notebook URL printed by Kaggle, not a user-supplied owner alias.
     remote = re.search(r"https?://(?:www\.)?kaggle\.com/code/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)", response.text)

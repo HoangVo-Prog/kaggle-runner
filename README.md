@@ -203,3 +203,8 @@ python -m unittest discover -s tests -v
 ```
 
 Official docs: [Kaggle kernels](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md), [kernel metadata](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md), [Kaggle terms](https://www.kaggle.com/terms).
+
+
+## Agent-first experiment candidate
+
+For versioned experiments, safe Python/notebook source inspection, atomic local capacity reservations, idempotent submit and scientific result validation, see [agent-first workflow](docs/AGENT_WORKFLOW_P0.md). **Candidate implementation:** review and run the complete offline suite before using real Kaggle jobs. Legacy commands remain available.

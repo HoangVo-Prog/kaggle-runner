@@ -93,6 +93,9 @@ def parser() -> argparse.ArgumentParser:
     active.add_argument("--strict", action="store_true", help="Verify historical terminal entries live (slower)")
     active.add_argument("--quiet", action="store_true", help="Disable progress messages on stderr")
     report = sub.add_parser("report", help="Summarize local jobs and optionally refresh remote status")
+    report.add_argument("report_target", nargs="?", choices=("experiment",))
+    report.add_argument("report_experiment_id", nargs="?")
+    report.add_argument("--format", choices=("md", "json"), default="md")
     report.add_argument("--refresh", action="store_true", help="Query remote statuses")
     report.add_argument("--limit", type=int, default=100)
     report.add_argument("--output", help="Write report JSON file")
@@ -181,6 +184,38 @@ def parser() -> argparse.ArgumentParser:
     m_search.add_argument("query", help="Search phrase")
     m_files = models_sub.add_parser("files", help="List files in a pinned model version")
     m_files.add_argument("ref", help="owner/model/framework/variation/version")
+    pkg = sub.add_parser("package", help="Inspect exact safe .py/.ipynb upload contents")
+    pkg_sub = pkg.add_subparsers(dest="package_command", required=True)
+    pk = pkg_sub.add_parser("inspect")
+    pk.add_argument("source")
+    pk.add_argument("--root")
+    pk.add_argument("--entry")
+    pk.add_argument("--max-source-mb", type=int, default=3)
+    pk.add_argument("--include", action="append")
+    pk.add_argument("--exclude", action="append")
+
+    exp = sub.add_parser("experiment", help="Durable experiment lifecycle")
+    exp_sub = exp.add_subparsers(dest="experiment_command", required=True)
+    exp_sub.add_parser("validate").add_argument("spec_file")
+    ex_submit = exp_sub.add_parser("submit")
+    ex_submit.add_argument("spec_file")
+    ex_submit.add_argument("--account", default="auto")
+    ex_submit.add_argument("--approve", action="store_true")
+    exp_sub.add_parser("show").add_argument("experiment_id")
+    ex_resume = exp_sub.add_parser("resume")
+    ex_resume.add_argument("experiment_id")
+    ex_resume.add_argument("--wait", action="store_true")
+    ex_resume.add_argument("--poll-seconds", type=int, default=20)
+    ex_resume.add_argument("--max-wait-minutes", type=int, default=45)
+
+    results = sub.add_parser("results", help="Validate and aggregate scientific outputs")
+    rs_sub = results.add_subparsers(dest="results_command", required=True)
+    rs_sub.add_parser("validate").add_argument("job_id")
+    rs_agg = rs_sub.add_parser("aggregate")
+    rs_agg.add_argument("--experiment-id", required=True)
+    rec = sub.add_parser("reconcile", help="Read-only remote reconciliation; never resubmit")
+    rec.add_argument("--experiment-id")
+
     # Accept both `kgr --json check` and `kgr check --json`, including nested
     # subcommands. SUPPRESS preserves the parent value when the child omits it.
     def child_json_flags(parser: argparse.ArgumentParser) -> None:
@@ -233,6 +268,58 @@ def _team_statuses(settings, store: JobStore, *, gpu: str, hours: float, limit: 
 
 def dispatch(a: argparse.Namespace) -> int:
     settings = build_settings(state_dir=a.state_dir, profile=a.profile, config=a.config)
+    if a.command in {"package", "experiment", "reconcile", "results"} or (a.command == "report" and a.report_target):
+        from . import agent_workflow as agent
+        from .source_contract import inspect_source
+        if a.command == "package":
+            _emit(inspect_source(a.source, root=a.root, entry=a.entry,
+                                 max_mb=a.max_source_mb, include=a.include,
+                                 exclude=a.exclude))
+            return 0
+        if a.command == "experiment":
+            if a.experiment_command == "validate":
+                _emit(agent.validate(a.spec_file))
+            elif a.experiment_command == "submit":
+                _emit(agent.submit(a.spec_file, settings=settings, env_file=a.env_file,
+                                   account=a.account, approve=a.approve))
+            elif a.experiment_command == "show":
+                _emit(agent.show(settings, a.experiment_id))
+            else:
+                outcome = agent.resume(settings, a.experiment_id, env_file=a.env_file,
+                                       wait=a.wait, poll_seconds=a.poll_seconds,
+                                       max_wait_minutes=a.max_wait_minutes)
+                _emit(outcome)
+                return 0 if outcome["ok"] else 3
+            return 0
+        if a.command == "reconcile":
+            _emit(agent.reconcile(settings, a.env_file, a.experiment_id))
+            return 0
+        if a.command == "results":
+            if a.results_command == "validate":
+                outcome = agent.validate_result(settings, a.job_id)
+            else:
+                outcome = agent.aggregate(settings, a.experiment_id)
+            _emit(outcome)
+            return 0 if outcome["ok"] else 3
+        if a.command == "report":
+            if not a.report_experiment_id:
+                raise RunnerError("report experiment requires EXPERIMENT_ID")
+            outcome = agent.report(settings, a.report_experiment_id, format=a.format)
+            evidence = agent.evidence_bundle(settings, a.report_experiment_id)
+            if a.format == "md" and not _JSON_OUTPUT.get():
+                print(
+                    outcome
+                    + "\n## Evidence bundle\n"
+                    + f"- SHA256: `{evidence['sha256']}`\n"
+                    + f"- Path: `{evidence['bundle_path']}`\n"
+                )
+            else:
+                if isinstance(outcome, dict):
+                    outcome["evidence"] = evidence
+                    _emit(outcome)
+                else:
+                    _emit({"report": outcome, "evidence": evidence})
+            return 0
     # Team profiles are self-contained and must never depend on, or accidentally
     # load, credentials from an unrelated single-account .env in the checkout.
     uses_team = a.command == "team" or (a.command == "run" and bool(a.account))
@@ -558,7 +645,18 @@ def dispatch(a: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = parser()
     try:
-        args = p.parse_args(argv)
+        try:
+            args = p.parse_args(argv)
+        except SystemExit as exc:
+            if int(exc.code or 0) != 0 and "--json" in (argv or sys.argv[1:]):
+                print(json.dumps({"schema_version": "1.0", "ok": False,
+                                  "error": {"code": "INVALID_ARGUMENTS",
+                                            "message": "Invalid CLI arguments",
+                                            "retryable": False, "action_required": "correct_arguments",
+                                            "job_id": None, "account_profile": None,
+                                            "details_redacted": {}}}))
+                return int(exc.code)
+            raise
         json_token = _JSON_OUTPUT.set(bool(args.json))
         command_token = _COMMAND.set(args.command or "")
         try:
@@ -567,8 +665,25 @@ def main(argv: list[str] | None = None) -> int:
             _JSON_OUTPUT.reset(json_token)
             _COMMAND.reset(command_token)
     except RunnerError as exc:
-        print(f"kgr: {exc}", file=sys.stderr)
+        is_json = bool(getattr(locals().get("args"), "json", False)) or "--json" in (argv or sys.argv[1:])
+        if is_json:
+            raw = str(exc)
+            code = raw.split(":", 1)[0].strip() if re.match(r"^[A-Z][A-Z0-9_]+:", raw) else "RUNNER_ERROR"
+            # Raw Kaggle exception text may include secrets or private runtime context.
+            # Do not echo diagnostics without guaranteed redaction.
+            print(json.dumps({"schema_version": "1.0", "ok": False,
+                "error": {"code": code, "message": "Operation failed; inspect redacted diagnostics",
+                          "retryable": False, "action_required": "inspect_or_reconcile",
+                          "job_id": None, "account_profile": None, "details_redacted": {}}}))
+        else:
+            print(f"kgr: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("kgr: interrupted", file=sys.stderr)
+        if "--json" in (argv or sys.argv[1:]):
+            print(json.dumps({"schema_version": "1.0", "ok": False,
+                              "error": {"code": "INTERRUPTED", "message": "Interrupted",
+                                        "retryable": False, "action_required": "reconcile",
+                                        "job_id": None, "account_profile": None, "details_redacted": {}}}))
+        else:
+            print("kgr: interrupted", file=sys.stderr)
         return 130

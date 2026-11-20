@@ -9,7 +9,7 @@ description = "Run Python experiments on Kaggle Notebooks and collect results"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{name = "Kaggle Runner contributors"}]
-dependencies = []
+dependencies = ["jsonschema>=4.20"]
 
 [project.optional-dependencies]
 kaggle = ["kaggle>=1.7"]
@@ -20,3 +20,6 @@ kgr = "kaggle_runner.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["kaggle_runner*"]
+
+[tool.setuptools.package-data]
+"kaggle_runner" = ["schemas/*.json"]

@@ -373,7 +373,7 @@ def tracked_active_report(cli: KaggleCLI, store: JobStore, *, owner: str | None 
     # Never filter local jobs by owner metadata: Kaggle can return a different
     # canonical owner during submit, and mixed CPU/GPU runs share one cap.
     candidates = [r for r in records if r["status"] in LOCAL_CANDIDATES
-                  and (account_profile is None or r.get("account_profile") == account_profile)]
+                  and r.get("account_profile") == account_profile]
     if len(candidates) > 50:
         raise RunnerError("More than 50 local jobs need verification; use `kgr sync` to refresh old records")
     running: list[dict] = []

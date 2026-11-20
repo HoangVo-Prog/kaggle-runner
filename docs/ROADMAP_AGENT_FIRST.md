@@ -109,3 +109,8 @@ kgr report experiment EXPT_ID --format md
 ```
 
 Do not implement a flashy agent UI before P0 idempotency, reservations, schema validation and recovery. These are what make autonomous operation **correct**, not just convenient.
+
+
+## Candidate implementation status (post-baseline)
+
+Agent-specific source inspection, durable attempt identities, local transactional reservations, reconcile, result validation/aggregation and reports are implemented in the candidate patch. Full P0 remains **unverified and incomplete** pending regression tests on the actual repository, legacy-run transactional integration, provider-specific error taxonomy and live Kaggle validation. Do not mark P0 complete yet.

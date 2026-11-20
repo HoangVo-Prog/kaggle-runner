@@ -1,0 +1,9 @@
+# ExperimentResult v1.0 and scientific reporting
+
+The Kaggle kernel must create `result.json` (or spec `result_file`) with the JSON structure described in `schemas/experiment_result.schema.json`. Required: `schema_version`, `experiment_id`, `attempt_id`, `status="succeeded"`, `seed`, `dataset` (`ref`, `split`), `protocol_id`, `source_sha256`, nonempty typed `metrics`, `samples_evaluated`, `runtime_seconds` and `artifacts`. Metric records contain a finite numeric `value`, `unit` (`fraction`, `percent`, `count`, `seconds` or `custom`) and boolean `higher_is_better`. Percent and fraction units enforce their natural ranges.
+
+The runner validates remote COMPLETE state separately from scientific success, then checks ID/seed/split/protocol/source identity, expected files, path safety and SHA256 against the download manifest. Invalid JSON, NaN/Infinity, mismatched runs, missing metrics or artifacts mark `invalid_result` (never `succeeded`). Artifact references may be filenames or `{path,sha256}` records. The file named by `result_file` must also appear in `expected_outputs`.
+
+`kgr results aggregate --experiment-id ID --json` includes only valid compatible attempts and reports each value, valid/invalid counts, sample standard deviation, warnings and an illustrative normal-approximation CI for 3+ runs; this interval is not automatically scientifically justified for few or dependent seeds. Source, protocol, dataset version/references, metric and parameters must match across aggregated attempts (seed may vary by attempt).
+
+`kgr report experiment ID --format md` composes an evidence-backed report and a separate content-addressed ZIP manifest recording frozen specs, state transitions, validation outcomes and artifact checksums. The evidence ZIP intentionally excludes raw remote logs (which could contain credentials) and large output payloads. Keep original downloaded artifacts separately.

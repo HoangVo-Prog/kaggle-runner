@@ -115,11 +115,12 @@ def _ignored(relative: Path, patterns: list[str]) -> bool:
                (p.endswith("/") and path.startswith(p)) for p in patterns)
 
 
-def source_files(root: Path, entry: str) -> list[Path]:
+def source_files(root: Path, entry: str, *, include: list[str] | None = None,
+                 exclude: list[str] | None = None) -> list[Path]:
     entry_path = Path(entry)
-    if entry_path.is_absolute() or ".." in entry_path.parts or entry_path.suffix != ".py":
-        raise RunnerError("Entrypoint must be a relative .py file without '..'")
-    patterns = _ignore_patterns(root)
+    if entry_path.is_absolute() or ".." in entry_path.parts or entry_path.suffix not in {".py", ".ipynb"}:
+        raise RunnerError("Entrypoint must be a relative .py/.ipynb file without '..'")
+    patterns = [*_ignore_patterns(root), *(exclude or [])]
     files: list[Path] = []
     for current, dirs, names in os.walk(root, followlinks=False):
         base = Path(current)
@@ -136,9 +137,11 @@ def source_files(root: Path, entry: str) -> list[Path]:
             if (name.lower() in EXCLUDE_FILES or name.lower().startswith(".env.")
                 or name.lower().endswith(".local.json") or p.suffix.lower() in EXCLUDE_SUFFIXES):
                 continue
-            if p.suffix.lower() not in ALLOWED_SUFFIXES and name not in {"Dockerfile", "Makefile"}:
+            if p.suffix.lower() not in ALLOWED_SUFFIXES and name not in {"Dockerfile", "Makefile"} and rel != entry_path:
                 continue
             if _ignored(rel, patterns):
+                continue
+            if include and rel != entry_path and not any(fnmatch.fnmatch(rel.as_posix(), rule) for rule in include):
                 continue
             if p.stat().st_size > MAX_FILE_BYTES:
                 raise RunnerError(f"Large source file {rel} ({p.stat().st_size} bytes). Use a Kaggle dataset instead")
@@ -148,8 +151,9 @@ def source_files(root: Path, entry: str) -> list[Path]:
     return files
 
 
-def pack_source(root: Path, entry: str, max_bytes: int) -> tuple[bytes, list[dict]]:
-    files = source_files(root, entry)
+def pack_source(root: Path, entry: str, max_bytes: int, *, include: list[str] | None = None,
+                exclude: list[str] | None = None) -> tuple[bytes, list[dict]]:
+    files = source_files(root, entry, include=include, exclude=exclude)
     if not files:
         raise RunnerError("No source files selected")
     output = io.BytesIO()
@@ -157,7 +161,10 @@ def pack_source(root: Path, entry: str, max_bytes: int) -> tuple[bytes, list[dic
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, compresslevel=8) as bundle:
         for relative in files:
             raw = (root / relative).read_bytes()
-            bundle.writestr(relative.as_posix(), raw)
+            info = zipfile.ZipInfo(relative.as_posix(), (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            bundle.writestr(info, raw)
             manifest.append({"path": relative.as_posix(), "bytes": len(raw),
                              "sha256": hashlib.sha256(raw).hexdigest()})
     data = output.getvalue()
@@ -185,6 +192,11 @@ project = pathlib.Path("/kaggle/working/kgr_source")
 project.mkdir(parents=True, exist_ok=True)
 output = pathlib.Path("/kaggle/working")
 result_path = output / "kgr_run_result.json"
+os.environ["KGR_EXPERIMENT_ID"] = _OPTIONS.get("experiment_id", "")
+os.environ["KGR_ATTEMPT_ID"] = _OPTIONS.get("attempt_id", "")
+os.environ["KGR_PARAMETERS_JSON"] = json.dumps(_OPTIONS.get("parameters", {}), sort_keys=True)
+os.environ["KGR_RESULT_FILENAME"] = _OPTIONS.get("expected_result", "result.json")
+os.environ["KGR_SOURCE_SHA256"] = _OPTIONS.get("source_sha256", "")
 result = {"status": "failed", "entry": _OPTIONS["entry"], "started_at": datetime.now(timezone.utc).isoformat()}
 try:
     archive = zipfile.ZipFile(io.BytesIO(base64.b64decode(_PAYLOAD)))
@@ -266,8 +278,14 @@ finally:
 
 def make_bootstrap(bundle: bytes, *, entry: str, arguments: list[str], datasets: list[str],
                    install_requirements: bool, unpack_datasets: bool = False,
-                   models: list[str] | None = None) -> str:
+                   models: list[str] | None = None, experiment_id: str = "",
+                   attempt_id: str = "", parameters: dict | None = None,
+                   expected_result: str = "result.json",
+                   source_sha256: str = "") -> str:
     options = {"entry": entry, "arguments": arguments, "datasets": datasets, "models": models or [],
+               "experiment_id": experiment_id, "attempt_id": attempt_id,
+               "parameters": parameters or {}, "expected_result": expected_result,
+               "source_sha256": source_sha256,
                "install_requirements": install_requirements, "unpack_datasets": unpack_datasets}
     encoded_options = base64.b64encode(json.dumps(options).encode()).decode("ascii")
     return (_BOOTSTRAP.replace("__PAYLOAD__", base64.b64encode(bundle).decode("ascii"))

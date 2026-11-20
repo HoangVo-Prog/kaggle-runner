@@ -97,3 +97,8 @@ kgr report --refresh --output ./reports/jobs.json --json
 ## Do not assume these commands exist yet
 
 `kgr queue`, `kgr cancel`, `kgr retry`, `kgr reconcile`, `kgr experiment`, `kgr metrics`, `kgr results validate`, `kgr agent serve`, `kgr agent plan`, `kgr scheduler` are **PROPOSED** APIs, not implemented in the inspected code. See [roadmap](ROADMAP_AGENT_FIRST.md).
+
+
+## Agent-specific commands (candidate)
+
+`kgr package inspect PATH [--root ROOT] [--entry FILE] [--include GLOB] [--exclude GLOB] --json`; `kgr experiment validate SPEC --json`; `kgr experiment submit SPEC [--account ALIAS] [--approve] --json`; `kgr experiment show EXPERIMENT_ID --json`; `kgr experiment resume EXPERIMENT_ID [--wait] --json`; `kgr reconcile [--experiment-id ID] --json`; `kgr results validate JOB_ID --json`; `kgr results aggregate --experiment-id ID --json`; `kgr report experiment ID --format md`. See [authoring](EXPERIMENT_AUTHORING.md).

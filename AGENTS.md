@@ -1,89 +1,50 @@
-# AGENTS.md — Kaggle Runner agent operating contract
+# AGENTS.md — Kaggle Runner operational contract
 
-> Applies to the `kaggle-runner` repository. Grounded against branch `cleanup/runner-only`, commit `cff2a661a3e6357febd9c574158fd58d020781ac` (2026-11-20). This document describes **current commands** and **required safeguards**; aspirational capabilities are explicitly marked **NOT IMPLEMENTED**.
+**Scope:** candidate agent-first CLI added to baseline `main` at `c778a14b`. This contract distinguishes working candidate capabilities from unresolved P0 acceptance; it is not a claim of full production or live Kaggle verification.
 
-## Mission
+## Mandatory safety rules
 
-Operate reproducible Kaggle experiments through the `kgr` CLI: inspect authorized resources, validate a submission, submit, track a persistent job ID, retrieve logs/artifacts, extract metrics and publish an evidence-based report. Never claim that submitting a kernel is equivalent to completing an experiment.
+1. Read the chosen ExperimentSpec and confirm research objective, data sharing policy, resource cost and **explicit** `authorization.allowed_profiles`. `--account auto` must not expand authorization.
+2. Keep all tokens in private project-root `.env` / the existing Kaggle credential configuration. Do not read, echo, commit, include in notebook output, embed in specs or attach to remote kernels. Never copy tokens into reports.
+3. Use `kgr experiment ... --json` and check both the exit code and `ok`; a successful push is **not** a scientifically successful experiment.
+4. Inspect upload contents *before* push using `kgr package inspect` and `kgr experiment validate`. Verify file names, SHA256, entrypoint, companion modules, runtime parameters, explicit dataset/model refs and expected outputs. Reject unsafe source trees.
+5. Use only `kgr experiment submit` for agent-managed work. The legacy `kgr run` command is preserved but not yet fully bound to the new transactional lease contract; do not use it concurrently with unattended workers.
+6. After `submit`, persist `job_id`, `experiment_id`, `attempt_id`, account alias and remote kernel ref from the JSON response. Never infer remote success from the local job ID alone.
+7. If a push fails ambiguously, do **not** push again. Execute `kgr reconcile --experiment-id ID --json` under the original account and request operator review if remote existence cannot be proven.
+8. Use `kgr experiment resume ID --json` or bounded `--wait`, not a new submission. Fetch artifacts with the original account token and compare hashes.
+9. Require a versioned `result.json`, validate it with `kgr results validate JOB_ID --json`, then aggregate only compatible attempts with `kgr results aggregate`.
+10. Generate report and content-addressed evidence using `kgr report experiment ID --format md`. Preserve provenance, excluded runs, uncertainty and limitations. Do not invent metrics.
+11. Never automatically rotate accounts to evade Kaggle limits, archive history, cancel remote kernels, upload private datasets, release unknown_remote leases or rerun failed code without explicit approval.
+12. Existing team `.env` diagnostics (`kgr team diagnose/list/check`) remain available, but local reservations cover **only processes sharing the same jobs.sqlite3**. Platform capacity remains Kaggle's authority.
 
-## Mandatory operating rules
-
-1. **Use a pre-authorized account.** The repo root `.env` defines team profiles via `KGR_TEAM_PROFILES` and `KGR_TEAM_<ALIAS>_USERNAME` / `_API_TOKEN`. `kgr team diagnose` and `kgr team list` can inspect configuration without exposing tokens. Run only under profiles whose owners explicitly authorized the agent's workload. `--account auto` is permitted only inside that pre-authorized scope; today it considers all configured team profiles, so isolate `.env` or select an explicit alias when authorization is narrower.
-2. **Never read, display, commit, transmit, or embed secrets.** Do not print `.env`, `KAGGLE_API_TOKEN`, shell environments, or raw CI secret stores. Avoid `set -x` when credentials may be present. Never store `.env` in Kaggle source, notebook cells, artifacts or reports. Use synthetic credentials in tests.
-3. **Prefer machine-readable output:** append `--json` to commands; parse JSON fields and process exit codes. Human-oriented terminal summaries are not a stable protocol. Note: `kgr logs --follow` streams plain text and rejects `--json`.
-4. **Do not infer free GPU/CPU slots from quota alone.** `kgr team check` estimates account-level eligibility from tracked local jobs plus GPU quota. This is *not* an authoritative reservation of Kaggle capacity. Interactive or out-of-band runs may be invisible. CPU and GPU share the same two-job *local policy cap* per profile.
-5. **Do not submit until inputs are validated.** Check expected source, entrypoint, GPU type, required GPU hours, dataset/model references, intended profile, privacy/internet settings, and output schema. Run `--dry-run` with an **explicit** account alias (not `auto`) before real submission when feasible.
-6. **Persist job identity before doing follow-up work.** Record `job_id`, `kernel_ref`, account profile and owner, input/source revision, launch time, and output location. Do not assume a locally generated Job ID proves the remote kernel exists; verify the submit response and subsequent status.
-7. **Never blindly retry `kgr run` after timeout or an ambiguous response.** A remote kernel may already have been created. First inspect `kgr jobs`, `kgr status`, `kgr show`, and the Kaggle URL. A durable idempotency key is **NOT IMPLEMENTED**.
-8. **Bound monitoring.** `kgr run --wait` has a deadline. A monitoring timeout does not cancel the remote run. Save the job ID and resume with `kgr status JOB_ID`; do not create a replacement run by default.
-9. **Treat uncertainty explicitly.** Distinguish `submitted`, `running`, `complete`, `error`, `cancelled`, `status_unavailable`, `archived`, and unknown states; do not report a successful experiment without a completed remote execution and validated output.
-10. **Do not archive or repair automatically.** `kgr repair` edits a local kernel reference; `kgr archive JOB_ID --confirm-inactive` excludes a job from local preflight but does **not** cancel it on Kaggle. Both require independent verification or human authorization.
-11. **Never fabricate metrics.** Report only metrics extracted from validated artifacts (e.g., `result.json`) and label missing metrics as `unavailable`; report the metric definition, source artifact, seed, dataset split, and code revision whenever provided.
-12. **Do not use automatic account selection to evade platform limits.** Respect each member's authorization and Kaggle's account and resource terms. Avoid mixing different owners' work without permission.
-
-## Supported tools and precise commands
+## Recommended deterministic command sequence
 
 ```bash
 kgr team diagnose
 kgr team list --json
-kgr team check --gpu t4x2 --required-gpu-hours 2 --json
-kgr run ./train.py --account alice --gpu t4x2 --required-gpu-hours 2 --dry-run --json
-kgr run ./train.py --account alice --gpu t4x2 --required-gpu-hours 2 --json
-kgr run ./train.py --account auto --gpu cpu --json
-kgr jobs --json
-kgr status JOB_ID --json
-kgr logs JOB_ID --json
-kgr outputs JOB_ID --json
-kgr fetch JOB_ID --output ./results/JOB_ID --json
-kgr report --refresh --output ./reports/jobs.json --json
+kgr package inspect ./experiment --entry train.py --json
+kgr experiment validate ./experiment/experiment.json --json
+kgr experiment submit ./experiment/experiment.json --account alice --approve --json
+kgr experiment show EXPERIMENT_ID --json
+kgr reconcile --experiment-id EXPERIMENT_ID --json
+kgr experiment resume EXPERIMENT_ID --wait --max-wait-minutes 45 --json
+kgr results validate JOB_ID --json
+kgr results aggregate --experiment-id EXPERIMENT_ID --json
+kgr report experiment EXPERIMENT_ID --format md
 ```
 
-`kgr check`, `kgr quota`, and `kgr active` without `--account` operate on the legacy/default account rather than iterating the team. For team-wide eligibility use `kgr team check`. **Known caveat at the pinned commit:** default `kgr active/check` can select team jobs in a mixed SQLite ledger using the default token. Do not use these default commands as a team-wide source of truth. `--json` is available before/after commands and in nested subcommands. Source packaging, fetch, and reports are implemented; a standardized experiment result parser, idempotency key, atomic scheduler, and unattended service are **NOT IMPLEMENTED**.
+Use `kgr package inspect ./experiment.ipynb --json` for native notebook entrypoints. Notebook code reads `KGR_PARAMETERS_JSON`, and both formats write standardized scientific output to `KGR_OUTPUT_DIR`. For new runs use distinct `attempt_id` values rather than trying to clear old records.
 
-## Required agent workflow
+## Stop and request operator intervention
 
-```
-ASSIGN -> VALIDATE -> PREFLIGHT -> DRY_RUN -> SUBMIT -> VERIFY_REMOTE
-    -> MONITOR -> FETCH -> VALIDATE_OUTPUT -> ANALYZE -> REPORT -> ARCHIVE_RECORD
-```
+Missing/invalid credentials, unauthorized profiles, quota/slot blocking, source-hash drift, suspected secrets in source, ambiguous remote submission, inaccessible remote kernel, schema mismatch, missing or inconsistent artifacts, destructive actions, compute exceeding approved budgets or scientifically invalid metrics. Do not silently downgrade any such failure to success.
 
-- **ASSIGN:** Establish experimental objective and explicit authorized account scope.
-- **VALIDATE:** Confirm source commit, dataset/model versions, expected outputs and budget.
-- **PREFLIGHT:** Use per-account checks; never infer global availability.
-- **DRY_RUN:** Check generated kernel metadata and source package; keep credentials out.
-- **SUBMIT:** One actual submit per logical experiment; capture `job_id`.
-- **VERIFY_REMOTE:** Confirm canonical `kernel_ref` from Kaggle and first status.
-- **MONITOR:** Poll with bounded retries for transient read errors, not resubmission.
-- **FETCH:** Download logs and output to a unique per-job directory.
-- **VALIDATE_OUTPUT:** Check expected filenames/JSON, hashes, metric schema and job success.
-- **ANALYZE:** Compare metrics only for compatible datasets/splits/protocols.
-- **REPORT:** Include source, settings, account metadata, artifact provenance, failures and limitations.
-- **ARCHIVE_RECORD:** Store reports outside credentials and keep recoverable job history.
-
-## Stop conditions requiring operator involvement
-
-- Missing profile/token, unauthorized profile, unrecognized owner, or unexpected credential usage.
-- CPU/GPU quota exhausted, uncertain slot availability when strict confidence is required, or policy violation.
-- Duplicate/ambiguous Kaggle submission, unexpected source code or dataset, remote execution with a different account.
-- Output schema mismatch, inaccessible private data, repeated unknown status, rate limits, or suspicious token exposure.
-- Any change that would delete source/artifacts, publish private data, or spend unapproved compute.
-
-## Code contributors: checks before claiming completion
+## Verification before completion claim
 
 ```bash
-python -m pip install -e '.[kaggle]'
 python -m unittest discover -s tests -v
-python -m unittest discover -s tests -p 'test_team_profiles.py' -v
-python -m unittest discover -s tests -p 'test_slot_scenarios.py' -v
+python -m unittest discover -s tests -p 'test_agent_first_p0.py' -v
+python -m unittest discover -s tests -p 'test_agent_workflow_p0.py' -v
 ```
 
-Unit tests mock Kaggle and **do not prove live resource availability**. Live smoke testing is opt-in and must use approved credentials:
-
-```bash
-python examples/team-env-multi-account/run_live_test.py \
-  --accounts alice bob --gpu cpu --confirm-live
-```
-
-**Never run the live smoke test automatically as part of a normal coding-agent test pass.** It creates two real Kaggle jobs.
-
-Read next: [documentation index](docs/INDEX.md), [agent workflow](docs/AGENT_WORKFLOW.md), [roadmap](docs/ROADMAP_AGENT_FIRST.md).
+Current code and limitations: [agent workflow](docs/AGENT_WORKFLOW_P0.md), [source packaging](docs/SOURCE_PACKAGING.md), [result contract](docs/RESULT_CONTRACT_AGENT.md), [recovery](docs/RECOVERY.md). Live tests require separate explicit approval and are not part of the offline test suite.

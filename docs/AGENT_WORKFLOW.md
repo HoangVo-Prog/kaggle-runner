@@ -105,3 +105,8 @@ Use one of these report outcomes rather than a binary success flag:
 - `NOT_SUBMITTED`: dry run, blocked preflight, or explicit refusal.
 
 These are **recommended reporting values**. They are **not** currently emitted by `kgr`; avoid claiming otherwise.
+
+
+## Agent-first candidate workflow
+
+Follow the [versioned agent workflow](AGENT_WORKFLOW_P0.md) when using `kgr experiment`. Do not use legacy `kgr run` as an atomic agent scheduler until the remaining P0 integration is complete.
