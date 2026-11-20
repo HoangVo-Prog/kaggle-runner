@@ -2,14 +2,29 @@
 
 `kgr` is a local CLI for packaging and running Kaggle kernels. The agent workflow is implemented as a CLI lifecycle, not as a resident scheduler or cross-machine coordinator. Read only the task guide needed:
 
-At the start of each new agent session, read this guide, then run:
+## Resolve the executable before any command (mandatory)
+
+Codex may run each command in a fresh shell with a different `PATH`. Never assume that `kgr` is available or that a prior `conda activate` persists. Resolve one working Kaggle Runner invocation at session startup and reuse it across **all** setup, work, experiment, and report commands.
+
+1. Try `command -v kgr` and then `kgr --help`. Do not use it if it points to an unrelated or stale installation.
+2. Otherwise, try `python -m kaggle_runner --help` (or `python3 -m kaggle_runner --help`). A module invocation does not require the `kgr` console script to be on `PATH`.
+3. If there is an existing project virtual environment, try its **explicit** interpreter: `./.venv/bin/python -m kaggle_runner --help` (Linux/WSL) or `.venv\Scripts\python.exe -m kaggle_runner --help` (Windows).
+4. If Conda exists, inspect `conda env list` and choose an existing, confirmed project environment. Use `conda run -n ENV_NAME --no-capture-output python -m kaggle_runner --help`. For later commands, reuse that entire `conda run ... python -m kaggle_runner` prefix, or use the selected environment's absolute Python executable. Do not guess the environment name.
+5. Check the selected interpreter's identity and imported package path with `python -c 'import sys, kaggle_runner; print(sys.executable); print(kaggle_runner.__file__)'` (replace `python` with the **selected invocation's Python**, including `conda run` when used). Verify that it points to the intended environment and checkout.
+6. If nothing works, stop and report the attempted **non-sensitive** executable locations. Do not silently install packages, create a Conda environment, modify credentials, reset SQLite, or use a different machine.
+
+A WSL Conda environment is not automatically accessible to native Windows processes or a remote Codex container. Keep the same `KGR_STATE_DIR`/`--state-dir` and `KGR_ENV_FILE`/`--env-file` throughout an objective. Treat `kgr: command not found` as an environment-resolution issue, **not** as permission to repeat setup.
+
+## Agent session startup
+
+After resolving a valid invocation, run the following commands, replacing `kgr` with the resolved `python -m kaggle_runner` or `conda run ... python -m kaggle_runner` prefix whenever necessary:
 
 ```bash
 kgr setup status --json
 kgr work list --active --json
 ```
 
-Reuse a current setup checkpoint; do not reinstall packages or recreate credentials. Revalidate only stale setup checks. For a selected objective, run `kgr work show OBJECTIVE_ID --json`, reconcile every linked experiment that may have crossed the remote push boundary, then continue from its persisted `next_action`. Do not create a duplicate objective or attempt after a restart, repeat an ambiguous push, or treat checklist evidence as proof of remote state.
+Reuse a current setup checkpoint; do not reinstall packages or recreate credentials. Revalidate only stale setup checks. For a selected objective, run `kgr work show OBJECTIVE_ID --json`, reconcile every linked experiment that may have crossed the remote push boundary, then continue from its persisted `next_action`. Apply the resolved invocation to all such commands. Do not create a duplicate objective or attempt after a restart, repeat an ambiguous push, or treat checklist evidence as proof of remote state.
 
 - First setup and offline example: [docs/QUICKSTART.md](docs/QUICKSTART.md)
 - Full submit, recovery, result and report lifecycle: [docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md)
