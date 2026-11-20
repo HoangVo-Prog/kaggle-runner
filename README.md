@@ -1,5 +1,15 @@
 # Kaggle Runner (`kgr`)
 
+> **Agent-first documentation (2026-11-20, audited commit `cff2a66`):**
+> Start with [docs/INDEX.md](docs/INDEX.md) for the complete guide and
+> [AGENTS.md](AGENTS.md) for agent safety/operation instructions.
+> See [docs/ROADMAP_AGENT_FIRST.md](docs/ROADMAP_AGENT_FIRST.md) for the features
+> still required before unattended agent execution is reliable.
+>
+> **Important:** Several historical sections below predate team profiles and
+> the root `.env` / fast tracked-job preflight. Follow the linked updated docs
+> whenever this README conflicts with the current implementation.
+
 A small, portable CLI to run **Python scripts and Jupyter notebooks on Kaggle**, attach Kaggle Datasets / Models, check resource eligibility before submission, track jobs, and download results. Uses Kaggle's **official CLI/API**; no Kaggle GPU server or local daemon required.
 
 ## Install & configure (once per machine)
