@@ -56,7 +56,16 @@ def build_settings(*, state_dir: str | None, profile: str | None, config: str | 
     kgr = settings.get("runner", {})
     if not isinstance(kgr, dict):
         raise RunnerError("[runner] must be a TOML table")
+    # Preserve precedence: CLI > configured runner.state_dir > KGR_STATE_DIR > platform default.
     state = state_directory(state_dir or kgr.get("state_dir"))
+    try:
+        state.stat()
+        if not state.is_dir():
+            raise RunnerError("STATE_DIRECTORY_INACCESSIBLE: selected state path is not a directory")
+    except FileNotFoundError:
+        pass  # Existing initialization behavior; diagnostic probes never create a ledger.
+    except OSError as exc:
+        raise RunnerError("STATE_DIRECTORY_INACCESSIBLE: inspect the selected state path and identity") from exc
     name = profile or os.getenv("KGR_PROFILE") or kgr.get("profile")
     if name and ("/" in name or "\\" in name or name in (".", "..")):
         raise RunnerError("Profile must be a simple alias, not a path")

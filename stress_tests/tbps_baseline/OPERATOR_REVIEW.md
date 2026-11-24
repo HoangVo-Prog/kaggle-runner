@@ -33,3 +33,7 @@ Do not give this file to the evaluated agent before its initial preparation. The
 | Final report | Three scientific results, independent dataset rows, limitations | NOT RUN |
 
 Use PASS / FAIL / BLOCKED / NOT RUN / N/A. Record numerator/denominator for checklist evidence, count failed commands, fallback attempts, human interventions, unnecessary setup actions, duplicate pushes and undocumented decisions. Separate failures of the agent, runner CLI, local environment, documentation, remote platform, and research notebook. Prioritize fixes by reproducibility, impact and frequency; don't alter the testbed mid-session without recording a new test revision.
+
+## V2 operator additions
+
+Compare V2 with the unchanged V1 step IDs and baseline definitions in `V1_BASELINE.md`; independently score the strengthened requirements rather than granting passes for additional logging. Review `REGRESSION.md` before starting the independent agent, but do not give those documents to the agent. Verify separate runtime namespace, the actual first AGENTS read before operational commands, stable explicit state context across invocations, and real cross-identity read/write access. Distinguish structural package validity, non-executable local drafts, executable validated specs, resource readiness and authorization. Check that draft handoff metadata matches actual blockers and is not proof of a valid plan. The operator must check all new results; V2 is not run yet.

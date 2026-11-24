@@ -17,12 +17,17 @@ A WSL Conda environment is not automatically accessible to native Windows proces
 
 ## Agent session startup
 
-After resolving a valid invocation, run the following commands, replacing `kgr` with the resolved `python -m kaggle_runner` or `conda run ... python -m kaggle_runner` prefix whenever necessary:
+After reading this guide, immediately record its hash, checkout revision, branch and worktree state. For an instrumented task, initialize its audit first. Resolve one interpreter and obtain the operator-confirmed absolute state directory. Explicit CLI `--state-dir` takes precedence over configured `runner.state_dir`, `KGR_STATE_DIR` and platform defaults. Do not rely on changing HOME/LOCALAPPDATA across sessions. Never create a replacement ledger when the intended path is inaccessible or a known objective is missing. Keep private credentials and state separate from shared redacted audit artifacts.
+
+After resolving a valid invocation, run the following commands with the same absolute state path before the subcommand (replace `kgr` with the selected module invocation):
 
 ```bash
-kgr setup status --json
-kgr work list --active --json
+kgr --state-dir "$STATE" setup preflight --expected-state-dir "$STATE" --json
+kgr --state-dir "$STATE" setup status --json
+kgr --state-dir "$STATE" work list --active --json
 ```
+
+The offline preflight probes temporary filesystem and SQLite operations without creating a job ledger. It cannot prove access by another identity. Provide `--audit-dir` for a separately provisioned shared artifact directory. Stop on path drift or inaccessible storage; ask the operator for exact provisioning rather than widening permissions. `package inspect` verifies structural packaging only; static indicators do not prove runtime readiness, dependencies, scientific validity, resource access or authorization. For a blocked unplanned draft, persist redacted facts and blockers with `work handoff OBJECTIVE_ID --file HANDOFF.json --expected-revision N --json` under the same state context. Do safe local source preparation independently of missing authorization; never turn an incomplete draft into a submit-ready plan.
 
 Reuse a current setup checkpoint; do not reinstall packages or recreate credentials. Revalidate only stale setup checks. For a selected objective, run `kgr work show OBJECTIVE_ID --json`, reconcile every linked experiment that may have crossed the remote push boundary, then continue from its persisted `next_action`. Apply the resolved invocation to all such commands. Do not create a duplicate objective or attempt after a restart, repeat an ambiguous push, or treat checklist evidence as proof of remote state.
 

@@ -296,6 +296,8 @@ class WorkLedger:
                 raise RunnerError("REVISION_CONFLICT: objective changed while the plan was being validated")
             meta = json.loads(row["metadata_json"])
             meta["plan"] = safe_plan
+            # A valid persisted plan supersedes draft-only blockers; preserve history in events/preparation.
+            meta.update(current_blocker=None, pending_operator_decision=None, next_action=None)
             meta["planned_gpu_hours"] = float(safe_plan.get("planned_gpu_hours", 0.0))
             meta["concurrency_limit"] = safe_plan.get("max_concurrent")
             meta["polling_seconds"] = safe_plan.get("polling_seconds")
@@ -719,7 +721,45 @@ def show(settings: Settings, objective_id: str) -> dict:
 def status(settings: Settings, objective_id: str) -> dict:
     result = show(settings, objective_id)
     return {k: result[k] for k in ("schema_version", "ok", "objective", "progress", "current_blocker",
-                                  "pending_operator_decision", "next_action")}
+                                  "pending_operator_decision", "next_action")} | {"preparation": result["objective"]["metadata"].get("preparation")}
+
+
+def record_handoff(settings: Settings, objective_id: str, handoff_file: str | Path, *, expected_revision: int) -> dict:
+    """Persist a draft handoff, not approval or an executable plan."""
+    try:
+        document = json.loads(Path(handoff_file).read_text(encoding="utf-8"),
+                              parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise RunnerError("INVALID_HANDOFF: cannot read JSON handoff") from exc
+    allowed = {"facts", "blockers", "missing_inputs", "pending_approvals", "completed_steps", "artifacts", "next_action"}
+    if not isinstance(document, dict) or set(document) - allowed or not isinstance(document.get("next_action"), str) or not document["next_action"].strip():
+        raise RunnerError("INVALID_HANDOFF: supported fields plus nonempty next_action required")
+    for key in allowed - {"next_action", "blockers"}:
+        if key in document and (not isinstance(document[key], list) or any(not isinstance(x, str) or not x.strip() for x in document[key])):
+            raise RunnerError("INVALID_HANDOFF: list fields must contain nonempty strings")
+    blockers = document.get("blockers", [])
+    if not isinstance(blockers, list):
+        raise RunnerError("INVALID_HANDOFF: blockers must be an array")
+    for item in blockers:
+        if (not isinstance(item, dict) or set(item) != {"code", "category", "summary", "evidence"}
+                or any(not isinstance(item.get(k), str) or not item[k].strip() for k in ("code", "category", "summary"))
+                or not isinstance(item["evidence"], list) or not item["evidence"]
+                or any(not isinstance(x, str) or not x.strip() for x in item["evidence"])):
+            raise RunnerError("INVALID_HANDOFF: each blocker requires code, category, summary and nonempty evidence strings")
+    if len(_json(document)) > 65536:
+        raise RunnerError("INVALID_HANDOFF: keep evidence references concise")
+    _assert_secret_free(document)
+    # Separate historical preparation evidence from authoritative attempt status.
+    ledger = WorkLedger(settings.state / "jobs.sqlite3", create=False)
+    current = ledger.get(objective_id)
+    if current["state"] != "draft" or current["metadata"].get("plan") or ledger.links(objective_id):
+        raise RunnerError("INVALID_HANDOFF: structured draft handoff is only for an unplanned objective")
+    ledger.change(objective_id, expected_revision=expected_revision,
+        metadata={"preparation": document, "current_blocker": blockers[0]["code"] if blockers else None,
+                  "pending_operator_decision": {"required": document.get("missing_inputs", []), "approvals": document.get("pending_approvals", [])},
+                  "next_action": document["next_action"]}, event_type="preparation_handoff",
+        detail={"blocker_count": len(blockers), "missing_input_count": len(document.get("missing_inputs", []))})
+    return show(settings, objective_id)
 
 
 def list_work(settings: Settings, *, active: bool = False) -> dict:
@@ -777,6 +817,8 @@ def resume(settings: Settings, objective_id: str) -> dict:
     links = result["attempts"]
     if obj["state"] in {"completed", "failed", "cancelled"}:
         return result
+    if obj["state"] == "draft" and not links:
+        return result  # Keep the persisted draft blocker/next action, never suggest submission.
     unknown = [a for a in links if (a.get("attempt") or {}).get("state") in {"unknown_remote", "manual_review"}]
     if unknown:
         result["current_blocker"] = "Ambiguous or manual-review attempts must be reconciled by experiment ID before execution continues"
@@ -1032,12 +1074,31 @@ def report(settings: Settings, objective_id: str) -> str:
     body = "\n".join(lines)
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     report_dir = settings.state / "work" / objective_id / "reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    target = report_dir / f"{digest}.md"
-    if not target.exists():
-        temporary = target.with_suffix(".md.tmp")
-        temporary.write_text(body, encoding="utf-8", newline="\n")
-        os.replace(temporary, target)
+    temporary = None
+    try:
+        if not report_dir.resolve().is_relative_to(settings.state.resolve()):
+            raise RunnerError("WORK_REPORT_PATH_FAILED: report path escapes the selected state directory")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        if not report_dir.resolve().is_relative_to(settings.state.resolve()):
+            raise RunnerError("WORK_REPORT_PATH_FAILED: resolved report directory changed")
+        target = report_dir / f"{digest}.md"
+        if target.is_symlink():
+            raise RunnerError("WORK_REPORT_PATH_FAILED: refuse symlink report target")
+        if not target.exists():
+            temporary = report_dir / f".{digest}.{secrets.token_hex(8)}.tmp"
+            with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            raise RunnerError("WORK_REPORT_PATH_FAILED: saved report hash does not match")
+    except OSError as exc:
+        raise RunnerError("WORK_REPORT_PATH_FAILED: verify report directory permissions under the selected state") from exc
+    finally:
+        if temporary is not None:
+            try: temporary.unlink(missing_ok=True)
+            except OSError: pass  # Do not delete or overwrite existing report evidence.
     work = WorkLedger(settings.state / "jobs.sqlite3", create=False)
     current = work.get(objective_id)
     record = {"path": str(target), "sha256": digest, "generated_at": stamp()}

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 import json
 import re
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -79,6 +80,9 @@ def parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup", help="Inspect and persist local setup verification checkpoints")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
     setup_sub.add_parser("status", help="Read setup checkpoint and show stale or missing checks")
+    preflight_setup = setup_sub.add_parser("preflight", help="Offline exact-directory and SQLite scratch diagnostics")
+    preflight_setup.add_argument("--audit-dir", help="Existing operator-provisioned shared audit directory")
+    preflight_setup.add_argument("--expected-state-dir", help="Compare against the original operator-confirmed state directory")
     verify_setup = setup_sub.add_parser("verify", help="Verify local setup or one explicit account online")
     verify_mode = verify_setup.add_mutually_exclusive_group(required=True)
     verify_mode.add_argument("--offline", action="store_true", help="Verify local prerequisites and stale source tests")
@@ -108,6 +112,10 @@ def parser() -> argparse.ArgumentParser:
     w_plan.add_argument("objective_id")
     w_plan.add_argument("--file", required=True)
     w_plan.add_argument("--expected-revision", type=int, required=True)
+    w_handoff = work_sub.add_parser("handoff", help="Persist structured preparation facts and blockers without an executable plan")
+    w_handoff.add_argument("objective_id")
+    w_handoff.add_argument("--file", required=True)
+    w_handoff.add_argument("--expected-revision", type=int, required=True)
     w_checkpoint = work_sub.add_parser("checkpoint", help="Record a validated checklist step and evidence")
     w_checkpoint.add_argument("objective_id")
     w_checkpoint.add_argument("--step", required=True)
@@ -327,6 +335,10 @@ def dispatch(a: argparse.Namespace) -> int:
         from . import setup_checkpoint
         if a.setup_command == "status":
             outcome = setup_checkpoint.status(settings, a.env_file)
+        elif a.setup_command == "preflight":
+            from .local_preflight import diagnose
+            outcome = diagnose(settings, env_file=a.env_file, audit_dir=a.audit_dir,
+                               expected_state_dir=a.expected_state_dir)
         else:
             if a.online and not a.account:
                 raise RunnerError("setup verify --online requires an explicit --account ALIAS")
@@ -356,6 +368,8 @@ def dispatch(a: argparse.Namespace) -> int:
                                              poll_seconds=a.poll_seconds, max_wait_minutes=a.max_wait_minutes)
         elif a.work_command == "plan":
             outcome = work_checkpoint.plan(settings, a.objective_id, a.file, expected_revision=a.expected_revision)
+        elif a.work_command == "handoff":
+            outcome = work_checkpoint.record_handoff(settings, a.objective_id, a.file, expected_revision=a.expected_revision)
         elif a.work_command == "checkpoint":
             evidence = json.loads(a.evidence_json) if a.evidence_json else []
             if not isinstance(evidence, list):
@@ -376,7 +390,8 @@ def dispatch(a: argparse.Namespace) -> int:
             if not _JSON_OUTPUT.get():
                 print(outcome)
                 return 0
-            outcome = {"report": outcome}
+            outcome = {"ok": True, "report": outcome}
+        outcome["state_directory"] = str(settings.state)
         _emit(outcome)
         return 0 if outcome.get("ok", True) else 3
     from .commands.agent import dispatch_agent_command
@@ -728,19 +743,25 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             _JSON_OUTPUT.reset(json_token)
             _COMMAND.reset(command_token)
-    except RunnerError as exc:
+    except (RunnerError, OSError, sqlite3.Error) as exc:
         is_json = bool(getattr(locals().get("args"), "json", False)) or "--json" in (argv or sys.argv[1:])
+        raw = str(exc)
+        code = raw.split(":", 1)[0].strip() if isinstance(exc, RunnerError) and re.match(r"^[A-Z][A-Z0-9_]+:", raw) else "RUNNER_ERROR"
+        if isinstance(exc, PermissionError): code = "FILESYSTEM_PERMISSION_DENIED"
+        elif isinstance(exc, sqlite3.Error): code = "SQLITE_ACCESS_FAILED"
+        elif isinstance(exc, OSError): code = "FILESYSTEM_OPERATION_FAILED"
+        path_codes = {"STATE_PATH_DRIFT", "STATE_DIRECTORY_INACCESSIBLE", "FILESYSTEM_PERMISSION_DENIED",
+                      "FILESYSTEM_OPERATION_FAILED", "SQLITE_ACCESS_FAILED", "WORK_REPORT_PATH_FAILED"}
+        action = ("verify_exact_state_path_and_permissions_then_reconcile" if code in path_codes else "inspect_or_reconcile")
+        message = ("Check the selected state directory, execution identity and artifact permissions; preserve existing state and reconcile uncertain attempts"
+                   if code in path_codes else "Operation failed; inspect redacted diagnostics")
         if is_json:
-            raw = str(exc)
-            code = raw.split(":", 1)[0].strip() if re.match(r"^[A-Z][A-Z0-9_]+:", raw) else "RUNNER_ERROR"
-            # Raw Kaggle exception text may include secrets or private runtime context.
-            # Do not echo diagnostics without guaranteed redaction.
             print(json.dumps({"schema_version": "1.0", "ok": False,
-                "error": {"code": code, "message": "Operation failed; inspect redacted diagnostics",
-                          "retryable": False, "action_required": "inspect_or_reconcile",
-                          "job_id": None, "account_profile": None, "details_redacted": {}}}))
+                "error": {"code": code, "message": message,
+                          "retryable": False, "action_required": action,
+                          "job_id": None, "account_profile": None, "details_redacted": ({"exception_type": type(exc).__name__} if code in path_codes else {})}}))
         else:
-            print(f"kgr: {exc}", file=sys.stderr)
+            print(f"kgr: {message if code in path_codes else exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         if "--json" in (argv or sys.argv[1:]):

@@ -8,11 +8,26 @@
   "dataset_resource": "https://www.kaggle.com/datasets/hoanggv/tbps-benchmark",
   "dataset_ref": "hoanggv/tbps-benchmark",
   "runs": [
-    {"run_key": "cuhk-pedes", "dataset_name": "CUHK-PEDES"},
-    {"run_key": "icfg-pedes", "dataset_name": "ICFG-PEDES"},
-    {"run_key": "rstpreid", "dataset_name": "RSTPReid"}
+    {
+      "run_key": "cuhk-pedes",
+      "dataset_name": "CUHK-PEDES"
+    },
+    {
+      "run_key": "icfg-pedes",
+      "dataset_name": "ICFG-PEDES"
+    },
+    {
+      "run_key": "rstpreid",
+      "dataset_name": "RSTPReid"
+    }
   ],
-  "training": {"name": "irra", "img_aug": true, "batch_size": 64, "loss_names": "itc", "num_epoch": 60},
+  "training": {
+    "name": "irra",
+    "img_aug": true,
+    "batch_size": 64,
+    "loss_names": "itc",
+    "num_epoch": 60
+  },
   "accelerator": "t4x2",
   "max_concurrent": 2,
   "approved_profiles": [],
@@ -21,5 +36,17 @@
   "live_submission_authorized": false,
   "seed_policy": "preserve original training seed semantics; inspect and record actual seed before planning",
   "metric_policy": "discover from evaluator and preserve original evaluation protocol",
-  "acceptance": {"planned_attempts": 3, "scientifically_validated_attempts": 3, "duplicate_pushes": 0, "unapproved_live_actions": 0}
+  "acceptance": {
+    "planned_attempts": 3,
+    "scientifically_validated_attempts": 3,
+    "duplicate_pushes": 0,
+    "unapproved_live_actions": 0
+  },
+  "testbed_version": 2,
+  "previous_testbed": "V1",
+  "existing_objective_id": "tbps-baseline-3gpu",
+  "runtime_namespace": "runtime_v2",
+  "operator_confirmed_state_dir": null,
+  "operator_confirmed_audit_dir": null,
+  "internet_policy": null
 }

@@ -176,15 +176,31 @@ def inspect_source(path: str | Path, *, root: str | Path | None = None,
     base, rel, kind = resolve_source(path, root, entry)
     if not 1 <= max_mb <= 25:
         raise RunnerError("max_mb must be between 1 and 25")
-    # Notebook validation is required before reporting safe_to_submit.
+    # Structural package validity does not establish scientific or execution readiness.
     if kind == "notebook":
-        read_notebook(base / rel)
+        nb = read_notebook(base / rel)
+        code = "\n".join("".join(c.get("source", "")) for c in nb["cells"] if c["cell_type"] == "code")
+    else:
+        code = (base / rel).read_text(encoding="utf-8", errors="replace")
     bundle, files = pack_source(base, rel, max_mb * 1024 * 1024,
                                 include=include, exclude=exclude)
     notebook_comps = [x["path"] for x in files if x["path"] != rel] if kind == "notebook" else []
     excluded = excluded_paths(base, files)
+    indicators = []
+    for name, pattern in (("external_source", r"(?i)\bgit\s+clone\b"),
+                          ("runtime_install", r"(?i)\b(?:pip|conda|uv)\s+(?:pip\s+)?install\b"),
+                          ("dataset_path", r"/kaggle/input(?:/|\b)"),
+                          ("network_resource", r"(?i)https?://")):
+        if re.search(pattern, code): indicators.append(name)
+    if "KGR_RESULT_FILENAME" not in code and "result.json" not in code:
+        indicators.append("result_writer_not_observed")
     return {
         "schema_version": VERSION, "ok": True, "safe_to_submit": True,
+        "safe_to_submit_scope": "structural_package_only_legacy_field",
+        "readiness": {"structural_package": "verified", "reproducibility": "not_verified",
+                      "experiment": "not_verified", "execution_authorization": "not_checked",
+                      "resource_access": "not_checked", "static_indicators": indicators,
+                      "dynamic_dependencies": "unresolved_by_static_inspection"},
         "root": str(base), "entrypoint": rel, "source_kind": kind,
         "source_revision": git_revision(base), "source_sha256": source_hash(files),
         "source_zip_sha256": digest(bundle), "source_zip_bytes": len(bundle),
