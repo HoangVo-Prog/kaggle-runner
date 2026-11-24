@@ -110,7 +110,8 @@ class AuditTests(unittest.TestCase):
         state=Path(self.tmp.name)/'state'; state.mkdir()
         db=state/'jobs.sqlite3'; db.write_bytes(b'fixture')
         st=db.stat(); ident={'device':st.st_dev,'inode':st.st_ino}
-        result={'ok':True,'status':'verified','selected':{'path':str(state),'identity':ident,'objective':{'id':'fixture','created_at':'time'}},'python_executable':sys.executable}
+        selected={'path':str(state),'status':'match','identity':ident,'objective':{'id':'fixture','created_at':'time'}}
+        result={'schema_version':1,'offline':True,'objective_id':'fixture','ok':True,'status':'verified','selected':selected,'candidates':[selected],'problems':[],'python_executable':sys.executable,'authorization':'not_checked','context_status':'saved'}
         with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout=json.dumps(result),stderr='')):
             self.assertEqual(self.call('discover','--objective','fixture'),0)
         self.assertEqual(audit.bound_state(self.root)['identity'],ident)
@@ -141,5 +142,86 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(audit.report(self.root)['operator_requests']['discovery_exhausted'],1)
         self.assertEqual(self.call('init','--session','b'),0)
         self.assertEqual(self.call('event','--kind','decision','--summary','ambiguous session'),2)
+
+    def test_structured_evidence_redacts_nested_credentials(self):
+        from unittest.mock import MagicMock
+        source={'ok':True,'package':{'execution_authorization':{'opaque':'fixture-auth-value'},
+                                   'api_key':'fixture-key-value'},
+                'items':[{'password':'fixture-password-value'},'Bearer fixture-bearer-value'],
+                'authorization':'not_checked','unicode':'Tiếng Việt'}
+        with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout=json.dumps(source),stderr='')):
+            self.assertEqual(self.call('kgr','--','package','inspect','fixture.py','--json'),0)
+        event=[e for e in audit.read_events(self.root) if e['kind']=='command_end'][-1]
+        body=Path(event['payload']['stdout']).read_text(encoding='utf-8')
+        decoded=json.loads(body)
+        self.assertEqual(decoded['authorization'],'not_checked')
+        self.assertEqual(decoded['package']['execution_authorization'],{'redacted':True})
+        self.assertEqual(decoded['unicode'],'Tiếng Việt')
+        for secret in ('fixture-auth-value','fixture-key-value','fixture-password-value','fixture-bearer-value'):
+            self.assertNotIn(secret,body)
+        self.assertEqual(event['payload']['output_status'],'valid_json')
+
+    def test_invalid_structured_output_fails_closed(self):
+        from unittest.mock import MagicMock
+        for source in ('{"authorization":{"opaque":"fixture-hidden"}',
+                       '{"ok":true,"ok":false}', '{"ok":NaN}', '{"ok":1e999}'):
+            with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout=source,stderr='')):
+                self.assertEqual(self.call('discover','--objective','fixture'),2)
+            self.assertIsNone(audit.bound_state(self.root))
+            event=[e for e in audit.read_events(self.root) if e['kind']=='command_end'][-1]
+            self.assertEqual(event['payload']['exit_code'],0)
+            self.assertEqual(event['payload']['output_status'],'invalid_json')
+            body=Path(event['payload']['stdout']).read_text(encoding='utf-8')
+            self.assertNotIn('fixture-hidden',body)
+            self.assertIn('CONTENT WITHHELD',body)
+
+    def test_verified_shape_with_multiple_matches_cannot_bind(self):
+        from unittest.mock import MagicMock
+        state=Path(self.tmp.name)/'state'; state.mkdir()
+        db=state/'jobs.sqlite3'; db.write_bytes(b'fixture')
+        st=db.stat()
+        selected={'path':str(state),'status':'match','identity':{'device':st.st_dev,'inode':st.st_ino},
+                  'objective':{'id':'fixture','created_at':'time'}}
+        result={'schema_version':1,'offline':True,'objective_id':'fixture','ok':True,'status':'verified',
+                'selected':selected,'candidates':[selected,dict(selected,path=str(state/'other'))],
+                'problems':[],'python_executable':sys.executable,'authorization':'not_checked'}
+        with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout=json.dumps(result),stderr='')):
+            self.assertEqual(self.call('discover','--objective','fixture'),2)
+        self.assertIsNone(audit.bound_state(self.root))
+
+    def test_real_discovery_subprocess_and_fresh_audit_session(self):
+        # A disposable fixture only: no real state, credentials or Kaggle API.
+        from contextlib import closing
+        state=Path(self.tmp.name).resolve()/'fixture-state'; state.mkdir()
+        with closing(sqlite3.connect(state/'jobs.sqlite3')) as con:
+            con.execute('CREATE TABLE jobs (job_id TEXT)')
+            con.execute('CREATE TABLE work_objectives (objective_id TEXT, created_at TEXT)')
+            con.execute("INSERT INTO work_objectives VALUES ('fixture-objective','date')")
+            con.commit()
+        context=Path(self.tmp.name).resolve()/'bootstrap.json'
+        self.assertEqual(self.call('discover','--objective','fixture-objective','--state-dir',str(state),
+                                   '--context-file',str(context)),0)
+        binding=audit.bound_state(self.root)
+        self.assertEqual(binding['state_dir'],str(state))
+        self.assertTrue(context.exists())
+        # Fresh audit root has no previous binding; Runner can recover the
+        # fixture via the persisted pointer and bounded discovery sources.
+        other=Path(self.tmp.name)/'runtime_v3-continuation'
+        self.root=other
+        self.assertEqual(self.call('init','--session','b'),0)
+        # Isolate real state candidates: use the fixture's explicit config and
+        # home directories; no operator state path on the discovery invocation.
+        import os
+        config=Path(self.tmp.name).resolve()/'empty.toml'; config.write_text('[runner]\n',encoding='utf-8')
+        home=Path(self.tmp.name).resolve()/'home'; home.mkdir()
+        overrides={'KGR_CONFIG':str(config),'KGR_STATE_DIR':'','HOME':str(home),
+                   'USERPROFILE':str(home),'LOCALAPPDATA':str(home),'XDG_STATE_HOME':str(home),
+                   'HOMEDRIVE':'','HOMEPATH':'','USERNAME':'','SystemDrive':''}
+        with patch.dict(os.environ,overrides):
+            self.assertEqual(self.call('discover','--objective','fixture-objective','--context-file',str(context)),0)
+        self.assertEqual(audit.bound_state(self.root)['identity'],binding['identity'])
+        event=[e for e in audit.read_events(self.root) if e['kind']=='state_discovery'][-1]
+        self.assertEqual(event['payload']['context_status'],'existing')
+        self.assertEqual(event['payload']['candidates'][0]['sources'],['bootstrap_context'])
 
 if __name__=='__main__': unittest.main()

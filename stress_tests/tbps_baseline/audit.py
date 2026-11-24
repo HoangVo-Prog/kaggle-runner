@@ -30,13 +30,59 @@ BEARER = re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+')
 
 def redact(value):
     if isinstance(value, dict):
-        return {k: ('[REDACTED]' if re.search(r'(?i)token|password|secret|api.?key|credential', k) else redact(v)) for k, v in value.items()}
+        result = {}
+        for k, v in value.items():
+            if k.casefold() in ('authorization', 'execution_authorization'):
+                # These fields may contain credentials. Only retain the known
+                # harmless discovery sentinel; never persist an unknown auth object.
+                result[k] = v if v == 'not_checked' else (
+                    {'redacted': True} if isinstance(v, dict) else
+                    ['[REDACTED]'] if isinstance(v, list) else '[REDACTED]')
+            elif re.search(r'(?i)token|password|secret|api.?key|credential', k):
+                result[k] = '[REDACTED]'
+            else:
+                result[k] = redact(v)
+        return result
     if isinstance(value, list):
         return [redact(x) for x in value]
     if isinstance(value, str):
         value = SECRET.sub(r'\1[REDACTED]', value)
         return BEARER.sub('Bearer [REDACTED]', value)
     return value
+
+
+def parse_structured_output(data):
+    """Return only strict JSON objects/arrays; never log raw parse errors."""
+    def pairs(items):
+        obj = {}
+        for key, value in items:
+            if key in obj:
+                raise ValueError('Duplicate JSON key')
+            obj[key] = value
+        return obj
+
+    def reject_constant(_):
+        raise ValueError('Nonstandard JSON constant')
+
+    try:
+        parsed = json.loads(data, object_pairs_hook=pairs,
+                            parse_constant=reject_constant)
+        # Overflowed floats (e.g. 1e999) must also be rejected.
+        json.dumps(parsed, allow_nan=False)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def evidence_output(data, parsed, *, expected_json=False):
+    if parsed is not None:
+        return json.dumps(redact(parsed), ensure_ascii=False, allow_nan=False,
+                          indent=2) + '\n'
+    if expected_json or data.lstrip().startswith(('{', '[')):
+        # A malformed structured response may contain nested secrets that a
+        # text regex cannot safely redact. Fail closed instead of exporting it.
+        return '[INVALID_STRUCTURED_OUTPUT; CONTENT WITHHELD]\n'
+    return redact(data)
 
 
 def now():
@@ -309,10 +355,25 @@ def bind_verified(root, session, objective, result):
     selected = result.get('selected')
     if result.get('ok') is not True or result.get('status') != 'verified' or not isinstance(selected, dict):
         return False
-    path = Path(selected['path'])
+    candidates = result.get('candidates')
+    selected_objective = selected.get('objective')
     ident = selected.get('identity')
-    if not path.is_absolute() or not isinstance(ident, dict) or selected.get('objective', {}).get('id') != objective:
+    raw_path = selected.get('path')
+    python = result.get('python_executable')
+    if (result.get('schema_version') != 1 or result.get('offline') is not True
+            or result.get('objective_id') != objective or result.get('problems') != []
+            or not isinstance(candidates, list)
+            or any(not isinstance(c, dict) for c in candidates)
+            or any(c.get('status') == 'unreadable' for c in candidates)
+            or [c for c in candidates if c.get('status') == 'match'] != [selected]
+            or not isinstance(selected_objective, dict)
+            or selected_objective.get('id') != objective
+            or not isinstance(raw_path, str) or not Path(raw_path).is_absolute()
+            or not isinstance(python, str) or not Path(python).is_absolute()
+            or not isinstance(ident, dict) or set(ident) != {'device', 'inode'}
+            or any(type(v) is not int for v in ident.values()) or not ident['inode']):
         raise ValueError('Invalid discovery result; no state binding')
+    path = Path(raw_path)
     db = (path/'jobs.sqlite3').stat()
     if ident != {'device':db.st_dev,'inode':db.st_ino}:
         raise ValueError('STATE_IDENTITY_DRIFT: ledger changed since discovery')
@@ -366,12 +427,25 @@ def run_command(root, args, capture=None):
         err += '\nCommand timed out; reconcile any uncertain side effects before retry.'
     except OSError as exc:
         code, out, err = 126, '', type(exc).__name__ + ': ' + str(exc)
-    for name, data in [('stdout',out),('stderr',err)]:
-        p = outdir/f'{cid}.{name}.txt'; p.write_text(redact(data),encoding='utf-8')
-    seq = add(root,args.session,'command_end',args.step,args.objective,command_id=cid,exit_code=code,elapsed_seconds=round(time.monotonic()-start,3),stdout=str(outdir/f'{cid}.stdout.txt'),stderr=str(outdir/f'{cid}.stderr.txt'))
-    if capture is not None: capture.update(stdout=redact(out), exit_code=code, event_id=seq)
-    print(redact(out),end=''); print(redact(err),end='',file=sys.stderr)
+    expected_json = (command is not None and '--json' in argv
+                     and not any(t in ('--help','-h','--version') for t in argv))
+    # Operational parsing precedes evidence redaction. The parsed discovery
+    # object stays in memory; it is never printed or written unredacted.
+    parsed = parse_structured_output(out)
+    safe_out = evidence_output(out, parsed, expected_json=expected_json)
+    safe_err = evidence_output(err, parse_structured_output(err))
+    output_status = ('valid_json' if parsed is not None else
+                     'invalid_json' if expected_json or out.lstrip().startswith(('{', '[')) else 'text')
+    for name, data in [('stdout',safe_out),('stderr',safe_err)]:
+        p = outdir/f'{cid}.{name}.txt'; p.write_text(data,encoding='utf-8')
+    seq = add(root,args.session,'command_end',args.step,args.objective,command_id=cid,exit_code=code,output_status=output_status,elapsed_seconds=round(time.monotonic()-start,3),stdout=str(outdir/f'{cid}.stdout.txt'),stderr=str(outdir/f'{cid}.stderr.txt'))
+    if capture is not None:
+        capture.update(result=parsed if isinstance(parsed, dict) else {}, exit_code=code, event_id=seq)
+    print(safe_out,end=''); print(safe_err,end='',file=sys.stderr)
     print(f'\n[audit event {seq}; command {cid}]',file=sys.stderr)
+    if code == 0 and expected_json and parsed is None:
+        print('INVALID_STRUCTURED_OUTPUT: successful subprocess returned invalid JSON',file=sys.stderr)
+        return 2
     return code if code>=0 else 128-code
 
 
@@ -468,8 +542,7 @@ def main(argv=None):
                 if a.context_file: argv+=['--context-file',a.context_file]
                 a.argv=argv; capture={}
                 code=run_command(a.root,a,capture)
-                try: result=json.loads(capture.get('stdout',''))
-                except ValueError: result={}
+                result=capture.get('result', {})
                 add(a.root,a.session,'state_discovery',a.step,a.objective,status=result.get('status','invalid_output'),command_event=capture.get('event_id'),candidates=result.get('candidates',[]),problems=result.get('problems',[]),context_status=result.get('context_status'))
                 if code==0 and not bind_verified(a.root,a.session,a.objective,result):
                     raise ValueError('Discovery did not return a verified state')
