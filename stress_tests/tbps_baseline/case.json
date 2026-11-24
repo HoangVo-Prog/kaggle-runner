@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "case_id": "tbps-baseline-3gpu",
+  "mode": "prepare_only",
+  "source_checkout_relative_to_runner": "workspaces/tbps",
+  "source_repository": "https://github.com/HoangVo-Prog/tbps",
+  "notebook": "irra/notebooks/kaggle_baseline.ipynb",
+  "dataset_resource": "https://www.kaggle.com/datasets/hoanggv/tbps-benchmark",
+  "dataset_ref": "hoanggv/tbps-benchmark",
+  "runs": [
+    {"run_key": "cuhk-pedes", "dataset_name": "CUHK-PEDES"},
+    {"run_key": "icfg-pedes", "dataset_name": "ICFG-PEDES"},
+    {"run_key": "rstpreid", "dataset_name": "RSTPReid"}
+  ],
+  "training": {"name": "irra", "img_aug": true, "batch_size": 64, "loss_names": "itc", "num_epoch": 60},
+  "accelerator": "t4x2",
+  "max_concurrent": 2,
+  "approved_profiles": [],
+  "approved_total_gpu_hours": null,
+  "planned_gpu_hours_per_dataset": null,
+  "live_submission_authorized": false,
+  "seed_policy": "preserve original training seed semantics; inspect and record actual seed before planning",
+  "metric_policy": "discover from evaluator and preserve original evaluation protocol",
+  "acceptance": {"planned_attempts": 3, "scientifically_validated_attempts": 3, "duplicate_pushes": 0, "unapproved_live_actions": 0}
+}
