@@ -6,11 +6,13 @@ from ..config import RunnerError, Settings
 from ..source_contract import inspect_source
 
 
-def dispatch_agent_command(args, settings: Settings, emit, *, json_output: bool) -> int | None:
+def dispatch_agent_command(args, settings: Settings | None, emit, *, json_output: bool) -> int | None:
     """Handle an agent-first command, returning None when it is not in this group."""
     if args.command not in {"package", "experiment", "reconcile", "results"} and not (
             args.command == "report" and args.report_target):
         return None
+    if settings is None and not (args.command == "package" or (args.command == "experiment" and args.experiment_command == "validate")):
+        raise RunnerError("Stateful agent command requires resolved settings")
     if args.command == "package":
         emit(inspect_source(args.source, root=args.root, entry=args.entry,
                             max_mb=args.max_source_mb, include=args.include, exclude=args.exclude))

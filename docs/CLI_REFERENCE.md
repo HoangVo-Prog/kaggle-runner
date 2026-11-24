@@ -4,6 +4,7 @@ This is the concise agent command surface. Run `kgr COMMAND --help` for the pars
 
 | Command | Purpose | Machine result |
 | --- | --- | --- |
+| `kgr setup discover --objective-id ID [--remember] --json` | Bounded offline read-only discovery; optionally persist a local pointer on a verified unique match | Candidates, selection, file identity, blockers; `ok: false` on ambiguity/missing/unreadable state |
 | `kgr setup status --json` | Read local setup checkpoint; no network or database writes | Check statuses, stale findings, readiness and last tested revision |
 | `kgr setup verify --offline --json` | Recheck only missing/stale local components; run tests only for a new source fingerprint | Persisted check history and reused/revalidated lists |
 | `kgr setup verify --online --account ALIAS --json` | Add one read-only authentication check for an explicit configured account | Local checks plus account-specific auth status and last-success timestamp |

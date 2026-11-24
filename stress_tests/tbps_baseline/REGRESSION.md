@@ -22,3 +22,17 @@ Run in isolated temporary directories on Linux and native Windows using the actu
 | REG-16 | test_history_protected: existing V1/unversioned root rejected and bytes unchanged; verify archive separately | testbed | automated + operator |
 
 Run `python -m unittest discover -s stress_tests/tbps_baseline -p 'test_audit.py' -v`, `python -m unittest discover -s tests -p 'test_local_hardening.py' -v`, then `python -m unittest discover -s tests -v`. Review platform-specific results and preserve redacted evidence. No V2 evaluation score is populated by these fixture tests.
+
+## V3 additions (operator-only)
+
+Keep all original step IDs. A03 now requires candidate discovery before any operator root request; B04/C03 must proceed independently of A03 when feasible. C05 uses V3 exports. Mark unverified checks accurately; compare actual state discovery, package inspection and full spec validation separately.
+
+| Target | Automatic regression | Remaining operator verification |
+|---|---|---|
+| Unique/ambiguous/missing/inaccessible state | `test_state_discovery.py` | Real sandbox access, candidate completeness |
+| Context persistence, path drift and file replacement | `test_state_discovery.py`, `test_audit.py` | Context survives fresh session; no replacement ledger |
+| Stateless CLI dispatch | `test_state_discovery_cli.py`, audit tests | Complete real package independently of missing state |
+| Shorthand, UTF-8 Python output, audit separation | `test_audit.py` | Windows native shell and cross-identity exports |
+| Operator request classifications | `test_audit.py` | Review requests against actual evidence; count premature separately |
+
+Discovery does not bypass ACLs or prove write access. A different file identity after legitimate migration still requires human verification. V3 must not read V1/V2 evidence as a solution shortcut. No live operations.

@@ -27,7 +27,7 @@ EXCLUDE_DIRS = {
     ".ssh", "data", "datasets", "outputs", "output", "results", "checkpoints",
     "wandb", "build", "dist", ".idea", ".vscode", ".ruff_cache", ".cache",
 }
-EXCLUDE_FILES = {".env", "kaggle.json", "id_rsa", "id_ed25519", "credentials", "credentials.json", ".netrc"}
+EXCLUDE_FILES = {".env", "kaggle.json", "id_rsa", "id_ed25519", "credentials", "credentials.json", ".netrc", ".kgr-bootstrap.json"}
 EXCLUDE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".ckpt", ".pt", ".pth", ".safetensors", ".parquet"}
 ALLOWED_SUFFIXES = {".py", ".toml", ".txt", ".yaml", ".yml", ".json", ".cfg", ".ini", ".sh", ".md"}
 MAX_FILE_BYTES = 2 * 1024 * 1024

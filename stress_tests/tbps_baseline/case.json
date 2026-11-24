@@ -42,11 +42,12 @@
     "duplicate_pushes": 0,
     "unapproved_live_actions": 0
   },
-  "testbed_version": 2,
-  "previous_testbed": "V1",
+  "testbed_version": 3,
+  "previous_testbed": "V2",
   "existing_objective_id": "tbps-baseline-3gpu",
-  "runtime_namespace": "runtime_v2",
+  "runtime_namespace": "runtime_v3",
   "operator_confirmed_state_dir": null,
   "operator_confirmed_audit_dir": null,
-  "internet_policy": null
+  "internet_policy": null,
+  "state_discovery_policy": "discover existing objective first; no supplied exact root; no replacement ledger"
 }

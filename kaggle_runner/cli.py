@@ -80,6 +80,10 @@ def parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup", help="Inspect and persist local setup verification checkpoints")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
     setup_sub.add_parser("status", help="Read setup checkpoint and show stale or missing checks")
+    discover_setup = setup_sub.add_parser("discover", help="Discover existing state and objective without initializing a ledger")
+    discover_setup.add_argument("--objective-id", help="Existing objective ID; required for automatic selection")
+    discover_setup.add_argument("--context-file", help="Optional absolute local bootstrap context file")
+    discover_setup.add_argument("--remember", action="store_true", help="Persist a local pointer only after a verified unique match")
     preflight_setup = setup_sub.add_parser("preflight", help="Offline exact-directory and SQLite scratch diagnostics")
     preflight_setup.add_argument("--audit-dir", help="Existing operator-provisioned shared audit directory")
     preflight_setup.add_argument("--expected-state-dir", help="Compare against the original operator-confirmed state directory")
@@ -330,6 +334,20 @@ def _team_statuses(settings, store: JobStore, *, gpu: str, hours: float, limit: 
 
 
 def dispatch(a: argparse.Namespace) -> int:
+    # Discovery and structural/scientific validation must not depend on state access.
+    if a.command == "setup" and a.setup_command == "discover":
+        from .state_discovery import discover
+        try:
+            outcome = discover(objective_id=a.objective_id, state_dir=a.state_dir,
+                               config=a.config, context_file=a.context_file, remember=a.remember)
+        except (ValueError, OSError) as exc:
+            outcome = {"schema_version": 1, "ok": False, "status": "blocked",
+                       "error_type": type(exc).__name__, "action": "Inspect discovery inputs; never initialize replacement state"}
+        _emit(outcome)
+        return 0 if outcome["ok"] else 3
+    if a.command == "package" or (a.command == "experiment" and a.experiment_command == "validate"):
+        from .commands.agent import dispatch_agent_command
+        return dispatch_agent_command(a, None, _emit, json_output=_JSON_OUTPUT.get())
     settings = build_settings(state_dir=a.state_dir, profile=a.profile, config=a.config)
     if a.command == "setup":
         from . import setup_checkpoint

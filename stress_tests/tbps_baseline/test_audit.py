@@ -13,7 +13,7 @@ import audit
 class AuditTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.root=Path(self.tmp.name)/'runtime_v2'
+        self.root=Path(self.tmp.name)/'runtime_v3'
         self.repo=Path(self.tmp.name)/'repo'; self.repo.mkdir()
         (self.repo/'AGENTS.md').write_text('test instructions',encoding='utf-8')
         subprocess.run(['git','init','-q',str(self.repo)],check=True)
@@ -93,5 +93,53 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(self.call('event','--session','uninitialized','--kind','decision','--summary','no'),2)
         self.assertEqual(self.call('report'),0)
         self.assertEqual([json.loads(x) for x in (self.root/'events.jsonl').read_text(encoding='utf-8').splitlines()],events)
+
+    def test_stateless_allowed_without_state(self):
+        from unittest.mock import MagicMock
+        for cmd in (['package','inspect','file.py'], ['experiment','validate','spec.json'], ['setup','discover','--objective-id','fixture']):
+            with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout='{}',stderr='')) as run:
+                self.assertEqual(self.call('kgr','--',*cmd),0)
+                run.assert_called_once()
+        with patch('audit.subprocess.run') as run:
+            self.assertEqual(self.call('kgr','--','work','show','fixture'),3)
+            self.assertEqual(self.call('kgr','--','experiment','submit','spec.json'),3)
+            run.assert_not_called()
+
+    def test_verified_discovery_binds_and_detects_replacement(self):
+        from unittest.mock import MagicMock
+        state=Path(self.tmp.name)/'state'; state.mkdir()
+        db=state/'jobs.sqlite3'; db.write_bytes(b'fixture')
+        st=db.stat(); ident={'device':st.st_dev,'inode':st.st_ino}
+        result={'ok':True,'status':'verified','selected':{'path':str(state),'identity':ident,'objective':{'id':'fixture','created_at':'time'}},'python_executable':sys.executable}
+        with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout=json.dumps(result),stderr='')):
+            self.assertEqual(self.call('discover','--objective','fixture'),0)
+        self.assertEqual(audit.bound_state(self.root)['identity'],ident)
+        with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout='{}',stderr='')) as run:
+            self.assertEqual(self.call('kgr','--','work','show','fixture'),0)
+            self.assertIn(str(state),run.call_args.args[0])
+        db.rename(state/'old.sqlite3'); db.write_bytes(b'replacement')
+        with patch('audit.subprocess.run') as run:
+            self.assertEqual(self.call('kgr','--','work','show','fixture'),3)
+            run.assert_not_called()
+
+    def test_ambiguous_discovery_does_not_bind(self):
+        from unittest.mock import MagicMock
+        with patch('audit.subprocess.run',return_value=MagicMock(returncode=3,stdout='{"status":"ambiguous","ok":false}',stderr='')):
+            self.assertEqual(self.call('discover','--objective','fixture'),3)
+        self.assertIsNone(audit.bound_state(self.root))
+        self.assertEqual(audit.report(self.root)['state_discovery_attempts'],1)
+
+    def test_v2_history_preserved(self):
+        old=Path(self.tmp.name)/'runtime_v2'; old.mkdir(); evidence=old/'events.jsonl'; evidence.write_bytes(b'V2')
+        with self.assertRaises(ValueError): audit.report(old)
+        with self.assertRaises(ValueError): audit.ensure_v3(old/'child')
+        self.assertEqual(evidence.read_bytes(),b'V2')
+
+    def test_session_shorthand_and_operator_request(self):
+        self.assertEqual(self.call('event','--kind','operator_request','--summary','missing'),2)
+        self.assertEqual(self.call('event','--kind','operator_request','--summary','missing','--request-class','discovery_exhausted'),0)
+        self.assertEqual(audit.report(self.root)['operator_requests']['discovery_exhausted'],1)
+        self.assertEqual(self.call('init','--session','b'),0)
+        self.assertEqual(self.call('event','--kind','decision','--summary','ambiguous session'),2)
 
 if __name__=='__main__': unittest.main()

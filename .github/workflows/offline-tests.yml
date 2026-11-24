@@ -20,3 +20,19 @@ jobs:
         run: python -m compileall -q kaggle_runner
       - name: Run offline regression suite
         run: python -m unittest discover -s tests -v
+      - name: Audit regression suite
+        run: python -m unittest discover -s stress_tests/tbps_baseline -p test_audit.py -v
+
+  windows-local-hardening:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package and test dependencies
+        run: python -m pip install -e ".[kaggle,dev]"
+      - name: State discovery and CLI routing regression
+        run: python -m unittest discover -s tests -p "test_state_discovery*.py" -v
+      - name: Audit regression suite
+        run: python -m unittest discover -s stress_tests/tbps_baseline -p test_audit.py -v

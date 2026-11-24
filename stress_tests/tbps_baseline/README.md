@@ -1,33 +1,58 @@
-# TBPS baseline stress test V2 — preparation only
+# TBPS baseline stress test V3 — preparation only
 
-`case.json` is a test case, not authorization or an executable ExperimentSpec. Use the existing `workspaces/tbps` checkout and existing objective `tbps-baseline-3gpu` if found in the operator-confirmed state. Never create a replacement ledger/objective to hide a permission failure. `runtime/` is immutable historical V1 evidence; V2 uses `runtime_v2/` (or an explicitly provisioned absolute directory outside V1). Do not read operator-only material during an independent test.
+Same research task and 25 checklist IDs as V1/V2. The independent agent must discover the existing objective `tbps-baseline-3gpu` without being given the state root. Do not read historical runtime artifacts or operator-only materials. Preserve `runtime/` and `runtime_v2/`; V3 defaults to `runtime_v3/` (or an explicitly provisioned absolute shared directory). No remote API, GPU allocation, approval or training.
 
-## Startup and audit
+## Minimal startup (from Runner checkout root)
 
-Read root `AGENTS.md` first. Immediately initialize the audit from repository root, before Runner commands. Use any existing Python 3.9+ interpreter for the stdlib-only audit tool; separately resolve the Runner interpreter following AGENTS.md. `--root` goes before the audit subcommand; `KGR_AUDIT_ROOT` is an alternative. Examples below use the default V2 directory and an operator-confirmed absolute `STATE` path; replace placeholders with actual values. On Windows use the native equivalent of your chosen interpreter and path quoting.
+Read root `AGENTS.md` **first**. Initialize a fresh audit before Runner commands, using any existing Python 3.9+ interpreter (the Runner requires Python 3.11+). In PowerShell the same commands work with `python` replaced by the verified executable; if it is a quoted absolute path use PowerShell's `&` call operator. Do not quote a directory in place of `audit.py`.
 
 ```bash
-python3 stress_tests/tbps_baseline/audit.py init --session v2-prep-01 --objective tbps-baseline-3gpu
-python3 stress_tests/tbps_baseline/audit.py run --session v2-prep-01 --step A02 -- python -m kaggle_runner --help
-python3 stress_tests/tbps_baseline/audit.py bind-state --session v2-prep-01 --state-dir "$STATE" --evidence 'operator-confirmed existing path'
-python3 stress_tests/tbps_baseline/audit.py run --session v2-prep-01 --step A03 -- python -m kaggle_runner --state-dir "$STATE" setup preflight --expected-state-dir "$STATE" --audit-dir "$AUDIT" --json
-python3 stress_tests/tbps_baseline/audit.py run --session v2-prep-01 --step A03 -- python -m kaggle_runner --state-dir "$STATE" setup status --json
-python3 stress_tests/tbps_baseline/audit.py run --session v2-prep-01 --step A04 -- python -m kaggle_runner --state-dir "$STATE" work list --active --json
-python3 stress_tests/tbps_baseline/audit.py report
+python stress_tests/tbps_baseline/audit.py init --session v3-prep-01 --objective tbps-baseline-3gpu
+python stress_tests/tbps_baseline/audit.py kgr --step A02 -- --help
+python stress_tests/tbps_baseline/audit.py discover
 ```
 
-`init` probes create/read/write/rename/delete and scratch SQLite before creating a journal; it records AGENTS hash, Git revision, branch, tracked status, identity hint and interpreter. New sessions require new IDs; the journal and state binding persist. Keep one `--root` for all audit invocations. If Git rejects dubious ownership, startup tries only a per-command `-c safe.directory=<exact repository>`; never change global trust. Inspect startup evidence and tool history; logging a hash does not prove the agent read the instructions. If the exact state is inaccessible or the objective is unexpectedly absent, stop and ask the operator to confirm the path. Do not run offline setup verification until local directory preflight succeeds; do not re-install an existing environment.
+Resolve the correct Runner interpreter following AGENTS.md. If different from audit Python, pass `--python ABSOLUTE_VERIFIED_PYTHON` to `discover` and to stateless `kgr` calls before binding. No installation or environment recreation. Each command after `init` infers the session/objective **only when exactly one initialized session exists**. After a restart initialize a new session, and pass `--session NEW_ID` to all subsequent commands. Keep the same `--root` (or `KGR_AUDIT_ROOT`) if overriding the default.
 
-`event` accepts decision/observation/incident/doc_read/intervention/handoff/approval_note/retry/workaround/state_drift/escalation; use `--category runner|testbed|environment|documentation|authorization|science|unconfirmed`. Add a decision before acting, and an observation or incident after. `check --step A01 --status done --evidence ...` requires actual evidence; live steps must stay todo. `run` logs completed and failed commands, elapsed time and redacted output; unknown Runner commands and obvious remote actions are refused. `--live` cannot authorize V2. This is defense in depth, not a sandbox or general command classifier. Never log credentials, tokens, secret-bearing arguments, unrestricted output, shell environment dumps, or hidden reasoning. Manual commands must have equivalent observable evidence. `report` exports an atomic-per-file snapshot from SQLite. Do not run parallel report exporters; the journal remains authoritative.
+`discover` invokes `kgr setup discover --objective-id ... --remember --json`, logs candidate evidence and binds only a unique verified existing objective. It probes an existing local bootstrap pointer, configured paths, env and bounded user-home/platform hints, not other users' profiles or the whole disk. The process needs authorized filesystem access; it cannot bypass a Windows sandbox ACL. Discovery only reads the ledger and optionally writes a secret-free local `.kgr-bootstrap.json` pointer, never a new ledger. A matching objective and stable file identity are evidence, not remote authorization. An inaccessible or ambiguous candidate, corrupt/moved pointer or replaced ledger fails closed. A previously confirmed path can be passed to `discover --state-dir ABSOLUTE_PATH` only when it is actually confirmed; the legacy `bind-state` path-only command does not establish a verified binding.
 
-## Safe local preparation
+If discovery succeeds:
 
-Use `package inspect` before any remote authorization. Its legacy `safe_to_submit` field means structural packaging only: check `readiness` and unresolved dynamic dependencies. Local hashing, source adaptation in a separate copy, result writer fixtures, artifact/metric contract review and draft preparation do not require an authorized account. Do not modify the source notebook or change scientific protocol. Explicitly label incomplete drafts non-executable; `experiment validate` still enforces complete schema and authorization fields. If a persisted plan is not possible, write a redacted JSON handoff and use `work handoff OBJECTIVE_ID --file HANDOFF.json --expected-revision CURRENT --json` with the bound `--state-dir`. Supported fields are `facts`, `missing_inputs`, `pending_approvals`, `completed_steps`, `artifacts` (lists of strings), `blockers` (array of objects with `code`, `category`, `summary`, `evidence` list of strings), and `next_action` (nonempty string). No fake approvals; this changes metadata of an existing draft only. Read `work show` or `work resume` afterward and verify the revision and blocker fields.
+```bash
+python stress_tests/tbps_baseline/audit.py kgr --step A03 -- setup preflight --json
+python stress_tests/tbps_baseline/audit.py kgr --step A03 -- setup status --json
+python stress_tests/tbps_baseline/audit.py kgr --step A04 -- work show tbps-baseline-3gpu --json
+```
 
-## Directory accessibility
+The shorthand injects the verified absolute state path before the Runner subcommand, and the expected state and audit directories for preflight. It checks the ledger identity before stateful calls. If preflight fails, do not continue stateful operations. Reuse the Setup Checkpoint; offline verification only for missing/stale checks after successful preflight. A known objective must not be recreated. For linked attempts requiring remote reconciliation, record the blocker; remote reconciliation is NOT authorized during preparation.
 
-Private state, credentials and shared redacted audit artifacts have different access policies. Do not grant access to credentials to fix audit. The operator must provision the exact audit directory with appropriate inherited ACLs/group access for both identities. Windows Python does not request mode `0700` for shared audit dirs; Linux requests `0770`, subject to umask and ACL inheritance. Existing permissions are not changed. Run `audit.py --root <absolute-audit-dir> preflight` only against the new directory. It checks current process access, not human access. `setup preflight` probes the selected existing state and optional existing audit directory with isolated scratch files; it does not create a missing ledger. Operator must independently confirm the generated marker, journal and exports are accessible from the other identity (see operator instructions). If not, preserve evidence and stop. No blanket ACLs or privilege escalation.
+## Independent local preparation
 
-## Review
+Even if discovery, preflight or objective recovery fails, continue offline source inspection, hashing, local derived-copy adaptation, scientific result-contract review, fixtures and incomplete draft specs. The following needs no state binding:
 
-The original 15 preparation, nine live and one review step IDs are retained for comparison; strengthened criteria must be noted. Operator-only baseline and regression review are separate from the independent agent. `python -m unittest discover -s stress_tests/tbps_baseline -p 'test_audit.py' -v` and `python -m unittest discover -s tests -p 'test_local_hardening.py' -v` use isolated fixtures only. Stage B requires a new explicitly approved protocol and is not performed in V2 preparation.
+```bash
+python stress_tests/tbps_baseline/audit.py kgr --step B04 -- package inspect workspaces/tbps/irra/notebooks/kaggle_baseline.ipynb --json
+python stress_tests/tbps_baseline/audit.py kgr --step C03 -- experiment validate PATH_TO_COMPLETE_SPEC --json
+```
+
+A structurally valid package is not execution readiness. Do not fabricate budget, account authorization, dataset versions, metric values or other missing inputs. An incomplete draft is non-executable, even if the scientific parts are locally verified. Preserve the original notebook and training protocol. If the ledger is accessible, persist real structured blockers via `work handoff OBJECTIVE_ID --file HANDOFF.json --expected-revision CURRENT --json` and re-read objective. Otherwise write redacted local handoff with evidence and next action; do not claim persistence to Runner. See TASK.md for full constraints.
+
+## Audit and operator requests
+
+Use `audit.py event --kind decision --step A03 --summary ... --reason ... --evidence ...` before actions and observation/incident after. Use `audit.py run --step ID -- COMMAND ARG ...` for non-Runner commands, or log equivalent manual evidence. Use `audit.py check --step ID --status done --evidence ...` only on actual evidence. For questions to operator, log `--kind operator_request --request-class necessary_intervention|avoidable_intervention|discovery_exhausted|premature_intervention` with the attempted discovery and precise blocker. Do not count a question as an actual operator intervention unless one occurred. Record concise operational rationales, not private chain-of-thought. No raw credentials, environment dumps, secrets, or unrestricted output. UTF-8 is forced for Python subprocesses; arbitrary external programs may emit other encodings. The audit is defense in depth, not a sandbox.
+
+```bash
+python stress_tests/tbps_baseline/audit.py report
+```
+
+Operator must independently verify access to redacted runtime artifacts. Do not grant blanket permissions or modify private state/credentials. Preserve V1/V2 and the V3 journal; never merge or pre-mark evidence. Review the same 15 preparation/9 live/1 review step IDs, with explicit criteria changes documented in REGRESSION.md. Stage B requires separate explicit authorization, never self-approve.
+
+## Regression verification (operator or patch-development session only)
+
+```bash
+python -m unittest discover -s tests -p 'test_state_discovery*.py' -v
+python -m unittest discover -s stress_tests/tbps_baseline -p 'test_audit.py' -v
+python -m unittest discover -s tests -v
+```
+
+These use isolated fixtures. Test Windows native separately; Linux success cannot establish cross-identity Windows accessibility. Do not run V3 as part of patch validation.

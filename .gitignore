@@ -12,6 +12,7 @@ dist/
 .coverage*
 
 # Local credentials / machine-specific configuration
+.kgr-bootstrap.json
 .env
 .env.*
 !.env.example

@@ -19,9 +19,9 @@ import uuid
 
 HERE = Path(__file__).resolve().parent
 STATES = ('todo', 'in_progress', 'done', 'blocked', 'skipped', 'stale')
-KINDS = ('decision', 'observation', 'incident', 'doc_read', 'intervention', 'handoff', 'approval_note', 'retry', 'workaround', 'state_drift', 'escalation')
-CATEGORIES = ('runner', 'testbed', 'environment', 'documentation', 'authorization', 'science', 'unconfirmed')
-VERSION = 2
+KINDS = ('decision', 'observation', 'incident', 'doc_read', 'intervention', 'handoff', 'approval_note', 'retry', 'workaround', 'state_drift', 'escalation', 'operator_request')
+CATEGORIES = ('runner', 'testbed', 'environment', 'documentation', 'authorization', 'science', 'unconfirmed', 'agent_invocation', 'bootstrap')
+VERSION = 3
 MARKER = 'audit-version.json'
 # Best-effort defense only. Never supply secrets to this utility.
 SECRET = re.compile(r'(?i)(["\']?(?:[\w-]*(?:api[_-]?token|api[_-]?key|password|secret|credential)[\w-]*|authorization|access[_-]?token)["\']?\s*[:=]\s*)(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s,;}]+)')
@@ -102,31 +102,37 @@ def probe(root):
     return result
 
 
-def ensure_v2(root):
-    if root.name.casefold() == 'runtime' or root.resolve().name.casefold() == 'runtime' or root.resolve().is_relative_to((HERE/'runtime').resolve()):
-        raise ValueError('V1 runtime is historical evidence; use runtime_v2 or a new operator-provisioned directory')
+def historical_root(root):
+    resolved = root.resolve()
+    return any(p.name.casefold() in ('runtime', 'runtime_v2') or p.name.casefold().startswith('runtime_v2-') for p in (resolved, *resolved.parents))
+
+
+def ensure_v3(root):
+    if historical_root(root):
+        raise ValueError('V1/V2 runtime is historical evidence; use a fresh V3 directory')
     marker = root / MARKER
     if marker.exists():
-        if json.loads(marker.read_text(encoding='utf-8')) != {'version': VERSION, 'case_id': 'tbps-baseline-3gpu', 'previous': 'V1'}:
+        if json.loads(marker.read_text(encoding='utf-8')) != {'version': VERSION, 'case_id': 'tbps-baseline-3gpu', 'previous': 'V2'}:
             raise ValueError('Audit version mismatch; preserve existing evidence')
         return
     if any((root / name).exists() for name in ('audit.sqlite3', 'events.jsonl', 'checklist.csv', 'audit-summary.md', 'handoff.md')):
-        raise ValueError('Unversioned existing audit evidence; choose a fresh V2 directory')
+        raise ValueError('Unversioned existing audit evidence; choose a fresh V3 directory')
     verdict = probe(root)
     if not verdict['ok']:
         raise OSError('AUDIT_DIRECTORY_INACCESSIBLE: ' + json.dumps(verdict))
     try:
         with marker.open('x', encoding='utf-8') as f:
-            json.dump({'version': VERSION, 'case_id': 'tbps-baseline-3gpu', 'previous': 'V1'}, f)
+            json.dump({'version': VERSION, 'case_id': 'tbps-baseline-3gpu', 'previous': 'V2'}, f)
     except FileExistsError:
-        if json.loads(marker.read_text(encoding='utf-8')) != {'version': VERSION, 'case_id': 'tbps-baseline-3gpu', 'previous': 'V1'}:
+        if json.loads(marker.read_text(encoding='utf-8')) != {'version': VERSION, 'case_id': 'tbps-baseline-3gpu', 'previous': 'V2'}:
             raise ValueError('Audit version mismatch')
 
 
 @contextmanager
 def connect(root, *, readonly=False):
+    if historical_root(root): raise ValueError('Historical runtime must not be opened by V3')
     if not readonly:
-        ensure_v2(root)
+        ensure_v3(root)
     db = root / 'audit.sqlite3'
     uri = db.resolve().as_uri() + '?mode=ro' if readonly else str(db)
     with closing(sqlite3.connect(uri, timeout=30, uri=readonly)) as con:
@@ -147,7 +153,7 @@ def startup(root, session, objective, runner_root):
         base = ['git', '-C', str(runner_root)]
         for prefix in (base, ['git', '-c', f'safe.directory={runner_root.as_posix()}', '-C', str(runner_root)]):
             try:
-                p = subprocess.run(prefix + list(args), capture_output=True, text=True, errors='replace', timeout=15)
+                p = subprocess.run(prefix + list(args), capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
                 attempts.append({'argv': prefix+list(args), 'exit_code': p.returncode, 'stderr': redact(p.stderr)})
                 if p.returncode == 0: return p.stdout.strip()
                 if 'dubious ownership' not in p.stderr.lower(): break
@@ -169,7 +175,7 @@ def startup(root, session, objective, runner_root):
 
 def require_session(root, session):
     if not any(e['kind']=='session_start' and e['session']==session and e['payload'].get('testbed_version')==VERSION for e in read_events(root)):
-        raise ValueError('Initialize this V2 session immediately after reading root AGENTS.md, before runner commands')
+        raise ValueError('Initialize this V3 session immediately after reading root AGENTS.md, before runner commands')
 
 
 def add(root, session, kind, step=None, objective=None, **payload):
@@ -205,7 +211,7 @@ def atomic_text(path, body):
 
 
 def report(root):
-    ensure_v2(root)
+    ensure_v3(root)
     events = read_events(root)
     checks = {s['id']: dict(s, status='todo', evidence='', event_id='') for s in steps()}
     for e in events:
@@ -222,6 +228,9 @@ def report(root):
     stats['workarounds'] = sum(e['kind']=='workaround' for e in events)
     stats['state_drift_events'] = sum(e['kind']=='state_drift' for e in events)
     stats['escalations'] = sum(e['kind']=='escalation' for e in events)
+    stats['operator_requests'] = {k: sum(e['kind']=='operator_request' and e['payload'].get('request_class')==k for e in events) for k in ('necessary_intervention','avoidable_intervention','discovery_exhausted','premature_intervention')}
+    stats['state_discovery_attempts'] = sum(e['kind']=='state_discovery' for e in events)
+    stats['verified_state_bindings'] = sum(e['kind']=='state_bound' and bool(e['payload'].get('identity')) for e in events)
     stats['operator_access'] = 'unverified_cross_identity'
     stats['prepare_blocked'] = sum(s['phase']=='prepare' and s['status']=='blocked' for s in checks.values())
     stats['prepare_stale'] = sum(s['phase']=='prepare' and s['status']=='stale' for s in checks.values())
@@ -266,11 +275,59 @@ def obvious_live(argv):
             return True
     if tail[:2] == ['setup','verify']:
         return '--offline' not in tail or '--online' in tail
-    local = {('setup','status'),('setup','preflight'),('work','create'),('work','list'),('work','show'),('work','status'),('work','resume'),('work','plan'),('work','checkpoint'),('work','handoff'),('work','report'),('work','pause'),('package','inspect'),('experiment','validate'),('experiment','show'),('results','validate'),('results','aggregate'),('team','diagnose'),('team','list')}
+    local = {('setup','discover'),('setup','status'),('setup','preflight'),('work','create'),('work','list'),('work','show'),('work','status'),('work','resume'),('work','plan'),('work','checkpoint'),('work','handoff'),('work','report'),('work','pause'),('package','inspect'),('experiment','validate'),('experiment','show'),('results','validate'),('results','aggregate'),('team','diagnose'),('team','list')}
     return tuple(tail[:2]) not in local
 
 
-def run_command(root, args):
+# Only these actual Runner subcommands are independent of persistent state.
+STATELESS = {('setup','discover'), ('package','inspect'), ('experiment','validate')}
+
+
+def runner_tail(argv):
+    index = next((i for i,t in enumerate(argv) if t.lower() == 'kaggle_runner' or re.split(r'[/\\]',t.lower())[-1] in ('kgr','kgr.exe')), None)
+    if index is None:
+        return None, None
+    tail = argv[index+1:]; given = None
+    while tail and tail[0].startswith('--'):
+        opt = tail.pop(0)
+        if opt in ('--state-dir','--env-file','--profile','--config') and tail:
+            value = tail.pop(0)
+            if opt == '--state-dir': given = value
+        elif opt.startswith('--state-dir='):
+            given = opt.split('=',1)[1]
+        elif opt != '--json' and '=' not in opt:
+            break
+    return tuple(tail[:2]), given
+
+
+def bound_state(root):
+    bindings = [e['payload'] for e in read_events(root) if e['kind']=='state_bound']
+    return bindings[-1] if bindings else None
+
+
+def bind_verified(root, session, objective, result):
+    selected = result.get('selected')
+    if result.get('ok') is not True or result.get('status') != 'verified' or not isinstance(selected, dict):
+        return False
+    path = Path(selected['path'])
+    ident = selected.get('identity')
+    if not path.is_absolute() or not isinstance(ident, dict) or selected.get('objective', {}).get('id') != objective:
+        raise ValueError('Invalid discovery result; no state binding')
+    db = (path/'jobs.sqlite3').stat()
+    if ident != {'device':db.st_dev,'inode':db.st_ino}:
+        raise ValueError('STATE_IDENTITY_DRIFT: ledger changed since discovery')
+    with connect(root) as con:
+        con.execute('BEGIN IMMEDIATE')
+        prior = [json.loads(r[0]) for r in con.execute("SELECT payload FROM events WHERE kind='state_bound'")]
+        if any(os.path.normcase(r['state_dir']) != os.path.normcase(str(path.resolve())) or (r.get('identity') and r['identity']!=ident) for r in prior):
+            raise ValueError('STATE_PATH_DRIFT: previous binding differs')
+        if not prior or not prior[-1].get('identity'):
+            payload = {'state_dir':str(path.resolve()),'identity':ident,'objective':selected['objective'],'evidence':'Verified read-only setup discover result','python':result.get('python_executable')}
+            con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',(now(),session,objective,'state_bound','A03',json.dumps(redact(payload))))
+    return True
+
+
+def run_command(root, args, capture=None):
     argv = args.argv[:]
     if argv and argv[0] == '--': argv.pop(0)
     if not argv: raise ValueError('Missing command after --')
@@ -279,23 +336,26 @@ def run_command(root, args):
         print(f'Blocked live action; audit event {seq}', file=sys.stderr)
         return 3
     if args.live:
-        raise ValueError('V2 preparation audit cannot authorize live actions; Stage B requires a separate reviewed protocol')
-    runner_index = next((i for i,t in enumerate(argv) if t.lower() == 'kaggle_runner' or re.split(r'[/\\]',t.lower())[-1] in ('kgr','kgr.exe')), None)
-    if runner_index is not None and not any(t in ('--help','-h','--version') for t in argv[runner_index+1:]):
-        tail = argv[runner_index+1:]
-        given = next((t.split('=',1)[1] for t in tail if t.startswith('--state-dir=')), None)
-        if '--state-dir' in tail:
-            i=tail.index('--state-dir'); given=tail[i+1] if i+1<len(tail) else None
-        bound = [e['payload']['state_dir'] for e in read_events(root) if e['kind']=='state_bound']
-        if not bound or not given or not Path(given).is_absolute() or os.path.normcase(str(Path(given).resolve())) != os.path.normcase(bound[-1]):
-            add(root,args.session,'incident',args.step,args.objective,summary='State binding missing or mismatched',category='environment',reason='Explicit operator-confirmed --state-dir required',evidence='No command executed',command=argv)
-            print('STATE_PATH_DRIFT: bind-state and use explicit --state-dir',file=sys.stderr); return 3
+        raise ValueError('V3 preparation audit cannot authorize live actions; Stage B requires a separate reviewed protocol')
+    command, given = runner_tail(argv)
+    if command is not None and command not in STATELESS and not any(t in ('--help','-h','--version') for t in argv):
+        bound = bound_state(root)
+        valid = bool(bound and bound.get('identity') and given and Path(given).is_absolute() and os.path.normcase(str(Path(given).resolve())) == os.path.normcase(bound['state_dir']))
+        if valid and bound.get('identity'):
+            try:
+                st=(Path(given)/'jobs.sqlite3').stat()
+                valid = bound['identity']=={'device':st.st_dev,'inode':st.st_ino}
+            except OSError:
+                valid = False
+        if not valid:
+            add(root,args.session,'state_drift',args.step,args.objective,summary='State binding missing or mismatched',category='bootstrap',reason='Discover/bind existing ledger first; stateless commands remain available',evidence='No command executed',command=argv)
+            print('STATE_PATH_DRIFT: discover existing state first',file=sys.stderr); return 3
     cid = uuid.uuid4().hex
     start = time.monotonic()
     add(root,args.session,'command_start',args.step,args.objective,command_id=cid,argv=argv,cwd=str(Path.cwd()),approval_reference=args.approval_reference)
     outdir = root/'commands'; shared_mkdir(outdir)
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, errors='replace', timeout=args.timeout)
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=args.timeout, env={**os.environ,'PYTHONUTF8':'1','PYTHONIOENCODING':'utf-8'})
         code, out, err = proc.returncode, proc.stdout, proc.stderr
     except FileNotFoundError:
         code, out, err = 127, '', 'Executable not found'
@@ -309,6 +369,7 @@ def run_command(root, args):
     for name, data in [('stdout',out),('stderr',err)]:
         p = outdir/f'{cid}.{name}.txt'; p.write_text(redact(data),encoding='utf-8')
     seq = add(root,args.session,'command_end',args.step,args.objective,command_id=cid,exit_code=code,elapsed_seconds=round(time.monotonic()-start,3),stdout=str(outdir/f'{cid}.stdout.txt'),stderr=str(outdir/f'{cid}.stderr.txt'))
+    if capture is not None: capture.update(stdout=redact(out), exit_code=code, event_id=seq)
     print(redact(out),end=''); print(redact(err),end='',file=sys.stderr)
     print(f'\n[audit event {seq}; command {cid}]',file=sys.stderr)
     return code if code>=0 else 128-code
@@ -316,29 +377,48 @@ def run_command(root, args):
 
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--root',type=Path,default=Path(os.environ.get('KGR_AUDIT_ROOT', HERE/'runtime_v2')),help='Operator-provisioned shared V2 audit directory')
+    p.add_argument('--root',type=Path,default=Path(os.environ.get('KGR_AUDIT_ROOT', HERE/'runtime_v3')),help='Operator-provisioned shared V3 audit directory')
     sub=p.add_subparsers(dest='action',required=True)
     for name in ('init','event','check','run'):
-        q=sub.add_parser(name); q.add_argument('--session',required=True); q.add_argument('--objective'); q.add_argument('--step')
+        q=sub.add_parser(name); q.add_argument('--session',required=(name=='init')); q.add_argument('--objective'); q.add_argument('--step')
         if name=='init':
             q.add_argument('--runner-root',type=Path,default=HERE.parents[1])
         if name=='event':
-            q.add_argument('--kind',choices=KINDS,required=True); q.add_argument('--summary',required=True); q.add_argument('--reason',default=''); q.add_argument('--evidence',default=''); q.add_argument('--alternatives',default=''); q.add_argument('--expected',default=''); q.add_argument('--category',choices=CATEGORIES,default='unconfirmed')
+            q.add_argument('--kind',choices=KINDS,required=True); q.add_argument('--summary',required=True); q.add_argument('--reason',default=''); q.add_argument('--evidence',default=''); q.add_argument('--alternatives',default=''); q.add_argument('--expected',default=''); q.add_argument('--category',choices=CATEGORIES,default='unconfirmed'); q.add_argument('--request-class',choices=('necessary_intervention','avoidable_intervention','discovery_exhausted','premature_intervention'))
         if name=='check':
             q.add_argument('--status',choices=STATES,required=True); q.add_argument('--evidence',default='')
         if name=='run':
             q.add_argument('--timeout',type=float,default=None); q.add_argument('--live',action='store_true'); q.add_argument('--approval-reference'); q.add_argument('argv',nargs=argparse.REMAINDER)
     b=sub.add_parser('bind-state', help='Pin operator-confirmed state directory for this audit')
-    b.add_argument('--session', required=True); b.add_argument('--state-dir', type=Path, required=True); b.add_argument('--evidence', required=True); b.add_argument('--objective')
+    b.add_argument('--session'); b.add_argument('--state-dir', type=Path, required=True); b.add_argument('--evidence', required=True); b.add_argument('--objective')
+    for name in ('discover','kgr'):
+        q=sub.add_parser(name,help='Audited discovery and binding' if name=='discover' else 'Short audited Runner invocation')
+        q.add_argument('--session'); q.add_argument('--objective'); q.add_argument('--step',default='A03' if name=='discover' else None)
+        q.add_argument('--python',help='Verified Runner Python executable (defaults to bound interpreter or audit Python)')
+        q.add_argument('--timeout',type=float,default=None)
+        if name=='discover':
+            q.add_argument('--state-dir',help='Optional explicitly confirmed existing path')
+            q.add_argument('--context-file',help='Optional absolute bootstrap context path')
+        else: q.add_argument('argv',nargs=argparse.REMAINDER)
     sub.add_parser('report')
     sub.add_parser('preflight')
     a=p.parse_args(argv)
     try:
         if a.action=='preflight':
-            if a.root.name.casefold() == 'runtime' or a.root.resolve().name.casefold() == 'runtime' or a.root.resolve().is_relative_to((HERE/'runtime').resolve()) or ((a.root/'audit.sqlite3').exists() and not (a.root/MARKER).exists()): raise ValueError('Historical/unversioned directory must not be probed')
+            if historical_root(a.root) or ((a.root/'audit.sqlite3').exists() and not (a.root/MARKER).exists()): raise ValueError('Historical/unversioned directory must not be probed')
+            if (a.root/MARKER).exists(): ensure_v3(a.root)
             result=probe(a.root); print(json.dumps(result,indent=2)); return 0 if result['ok'] else 2
+        if a.action not in ('init','report','preflight'):
+            ensure_v3(a.root)
+            sessions = [e for e in read_events(a.root) if e['kind']=='session_start']
+            if not a.session:
+                if len(sessions)!=1: raise ValueError('Specify --session when zero or multiple sessions exist')
+                a.session=sessions[0]['session']
+            require_session(a.root,a.session)
+            if not a.objective:
+                a.objective=next((e['objective'] for e in sessions if e['session']==a.session),None)
         if a.action=='init':
-            ensure_v2(a.root)
+            ensure_v3(a.root)
             # Journal is reused; every new session gets one explicit start event.
             events=read_events(a.root)
             if not any(e['kind']=='session_start' and e['session']==a.session for e in events):
@@ -356,14 +436,58 @@ def main(argv=None):
                     con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)', (now(),a.session,a.objective,'state_bound','A03',json.dumps(redact({'state_dir':path,'evidence':a.evidence}))))
             print(json.dumps({'state_dir':path,'ok':True}))
         elif a.action=='event':
+            if a.kind=='operator_request' and not a.request_class: raise ValueError('Operator requests require --request-class')
             require_session(a.root,a.session)
-            print(add(a.root,a.session,a.kind,a.step,a.objective,summary=a.summary,reason=a.reason,evidence=a.evidence,alternatives=a.alternatives,expected=a.expected,category=a.category))
+            print(add(a.root,a.session,a.kind,a.step,a.objective,summary=a.summary,reason=a.reason,evidence=a.evidence,alternatives=a.alternatives,expected=a.expected,category=a.category,request_class=a.request_class))
         elif a.action=='check':
             require_session(a.root,a.session)
             if not a.step: raise ValueError('--step is required')
-            if a.step.startswith('D') and a.status != 'todo': raise ValueError('Live checklist remains todo in V2 preparation mode')
+            if a.step.startswith('D') and a.status != 'todo': raise ValueError('Live checklist remains todo in V3 preparation mode')
             if a.status in ('done','blocked','skipped','stale') and not a.evidence.strip(): raise ValueError('Evidence is required for this status')
             print(add(a.root,a.session,'check',a.step,a.objective,status=a.status,evidence=a.evidence))
+        elif a.action in ('discover','kgr'):
+            bound = bound_state(a.root)
+            python = a.python or (bound or {}).get('python') or sys.executable
+            a.live=False; a.approval_reference=None
+            if a.python and not Path(a.python).is_absolute(): raise ValueError('--python must be the absolute verified interpreter path')
+            if bound and bound.get('python') and os.path.normcase(str(Path(python).resolve())) != os.path.normcase(str(Path(bound['python']).resolve())):
+                raise ValueError('Runner interpreter changed; preserve this binding and request operator review')
+            if a.action=='discover':
+                if bound:
+                    if a.state_dir and os.path.normcase(str(Path(a.state_dir).resolve())) != os.path.normcase(bound['state_dir']):
+                        raise ValueError('STATE_PATH_DRIFT: discovery cannot replace an existing audit binding')
+                    if bound.get('identity'):
+                        st=(Path(bound['state_dir'])/'jobs.sqlite3').stat()
+                        if bound['identity'] != {'device':st.st_dev,'inode':st.st_ino}:
+                            raise ValueError('STATE_IDENTITY_DRIFT: bound ledger replaced')
+                    a.state_dir=bound['state_dir']
+                if not a.objective: raise ValueError('Discovery requires an objective ID')
+                argv=[python,'-m','kaggle_runner']
+                if a.state_dir: argv+=['--state-dir',a.state_dir]
+                argv+=['setup','discover','--objective-id',a.objective,'--remember','--json']
+                if a.context_file: argv+=['--context-file',a.context_file]
+                a.argv=argv; capture={}
+                code=run_command(a.root,a,capture)
+                try: result=json.loads(capture.get('stdout',''))
+                except ValueError: result={}
+                add(a.root,a.session,'state_discovery',a.step,a.objective,status=result.get('status','invalid_output'),command_event=capture.get('event_id'),candidates=result.get('candidates',[]),problems=result.get('problems',[]),context_status=result.get('context_status'))
+                if code==0 and not bind_verified(a.root,a.session,a.objective,result):
+                    raise ValueError('Discovery did not return a verified state')
+                return code
+            tail=a.argv[1:] if a.argv and a.argv[0]=='--' else a.argv
+            if not tail: raise ValueError('Pass Runner arguments after --')
+            command,_=runner_tail([python,'-m','kaggle_runner',*tail])
+            # Explicit options are accepted only if they match the existing binding.
+            a.argv=[python,'-m','kaggle_runner']
+            if command not in STATELESS and bound and not any(t=='--state-dir' or t.startswith('--state-dir=') for t in tail):
+                a.argv+=['--state-dir',bound['state_dir']]
+            a.argv+=tail
+            if command==('setup','preflight') and bound:
+                if not any(t=='--expected-state-dir' or t.startswith('--expected-state-dir=') for t in tail):
+                    a.argv+=['--expected-state-dir',bound['state_dir']]
+                if not any(t=='--audit-dir' or t.startswith('--audit-dir=') for t in tail):
+                    a.argv+=['--audit-dir',str(a.root.resolve())]
+            return run_command(a.root,a)
         elif a.action=='run':
             require_session(a.root,a.session)
             return run_command(a.root,a)
@@ -374,4 +498,6 @@ def main(argv=None):
 
 
 if __name__=='__main__':
+    for stream in (sys.stdout,sys.stderr):
+        if hasattr(stream,'reconfigure'): stream.reconfigure(encoding='utf-8',errors='replace')
     raise SystemExit(main())
