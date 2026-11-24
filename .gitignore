@@ -44,3 +44,4 @@ wandb/
 .vscode/
 .DS_Store
 Thumbs.db
+workspaces/*
