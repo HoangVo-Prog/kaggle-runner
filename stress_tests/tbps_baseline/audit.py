@@ -360,9 +360,26 @@ def bound_state(root):
     binding_event = bindings[-1]
     binding = dict(binding_event['payload'])
     for event in events:
-        if event['seq'] <= binding_event['seq'] or event['kind'] != 'interpreter_migration':
+        if event['seq'] <= binding_event['seq'] or event['kind'] not in ('interpreter_migration', 'state_location_migration'):
             continue
         migration = event['payload']
+        if event['kind'] == 'state_location_migration':
+            old_path = migration.get('old_state_dir')
+            new_path = migration.get('new_state_dir')
+            old_identity = migration.get('old_identity')
+            new_identity = migration.get('new_identity')
+            if (not isinstance(old_path, str) or not Path(old_path).is_absolute() or
+                    os.path.normcase(old_path) != os.path.normcase(binding.get('state_dir', '')) or
+                    not identity_matches(binding.get('identity'), old_identity) or
+                    not isinstance(new_path, str) or not Path(new_path).is_absolute() or
+                    not valid_file_identity(new_identity) or
+                    migration.get('objective') != binding.get('objective') or
+                    not migration.get('authorization_evidence') or not migration.get('reason')):
+                binding['migration_error'] = 'invalid_state_location_migration_record'
+                return binding
+            binding['state_dir'] = new_path
+            binding['identity'] = new_identity
+            continue
         old = migration.get('old_interpreter')
         new = migration.get('new_interpreter')
         if (not isinstance(old, dict) or not isinstance(new, dict) or
@@ -452,8 +469,8 @@ def migrate_interpreter(root, session, objective, new_python, authorization_evid
     effective = bound_state(root)
     if effective and effective.get('migration_error'):
         raise ValueError('Existing interpreter migration evidence is invalid')
-    state_dir = base.get('state_dir')
-    identity = base.get('identity')
+    state_dir = (effective or base).get('state_dir')
+    identity = (effective or base).get('identity')
     obj = base.get('objective')
     old_path = (effective or {}).get('python') or base.get('python')
     if (not isinstance(state_dir, str) or not Path(state_dir).is_absolute() or
@@ -493,6 +510,8 @@ def migrate_interpreter(root, session, objective, new_python, authorization_evid
     # transition only for the same ledger identity that the binding records.
     with connect(root) as con:
         con.execute('BEGIN IMMEDIATE')
+        if con.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0] != max(e['seq'] for e in events):
+            raise ValueError('Audit journal changed during interpreter migration')
         latest = con.execute("SELECT seq,payload FROM events WHERE kind='state_bound' ORDER BY seq DESC LIMIT 1").fetchone()
         if latest is None or latest['seq'] != base_event['seq'] or json.loads(latest['payload']) != base:
             raise ValueError('State binding changed during interpreter migration')
@@ -514,6 +533,179 @@ def migrate_interpreter(root, session, objective, new_python, authorization_evid
                                json.dumps(redact(payload), ensure_ascii=False, allow_nan=False)))
             return cur.lastrowid
     raise ValueError('Interpreter migration was not recorded')
+
+
+def _state_content(state_dir, objective_id):
+    """Return privacy-preserving logical and side-artifact digests for a quiesced state copy."""
+    state_dir = Path(state_dir).resolve(strict=True)
+    ledger = state_dir / 'jobs.sqlite3'
+    if Path(str(ledger) + '-wal').exists() or Path(str(ledger) + '-shm').exists():
+        raise ValueError('SQLite sidecars remain; quiesce Runner and complete a clean SQLite backup first')
+    before = file_identity(ledger)
+    try:
+        with closing(sqlite3.connect(ledger.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as con:
+            con.execute('PRAGMA query_only=ON')
+            if con.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                raise ValueError('STATE_INTEGRITY_FAILED')
+            tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'jobs' not in tables:
+                raise ValueError('Not a Runner ledger')
+            row = None
+            if 'work_objectives' in tables:
+                row = con.execute('SELECT objective_id,created_at,revision FROM work_objectives WHERE objective_id=?',
+                                  (objective_id,)).fetchone()
+            elif objective_id:
+                raise ValueError('Objective ledger table is missing')
+            logical = hashlib.sha256('\n'.join(con.iterdump()).encode('utf-8')).hexdigest()
+    except sqlite3.Error as exc:
+        raise ValueError('STATE_INTEGRITY_FAILED') from exc
+    after = file_identity(ledger)
+    if not identity_matches(before, after):
+        raise ValueError('STATE_IDENTITY_DRIFT: ledger changed during verification')
+    if objective_id and row is None:
+        raise ValueError('Objective is missing from state ledger')
+    artifacts = {}
+    for path in sorted(state_dir.rglob('*')):
+        if path.is_symlink():
+            raise ValueError('State contains a symlink/reparse-like artifact; operator review required')
+        if path.is_file() and path.resolve() != ledger:
+            relative = path.relative_to(state_dir).as_posix()
+            artifacts[relative] = sha(path)
+    artifact_digest = hashlib.sha256(json.dumps(artifacts, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return {'path': state_dir, 'identity': before, 'logical_digest': logical,
+            'objective_row': tuple(row) if row else None, 'artifacts': artifacts,
+            'artifact_digest': artifact_digest}
+
+
+def transition_state_location(root, session, objective, source_dir, destination_dir,
+                              context_file, authorization_evidence, reason, source_data_dir=None):
+    """Append a verified state-location transition and atomically advance the pointer.
+
+    Database/files copying and source archival are intentionally an operator procedure;
+    this command accepts only a quiesced, already verified destination copy.
+    """
+    if not authorization_evidence or not authorization_evidence.strip():
+        raise ValueError('Explicit --authorization-evidence is required')
+    if not reason or not reason.strip():
+        raise ValueError('A migration reason is required')
+    if not session:
+        raise ValueError('An initialized audit session is required')
+    source = Path(os.path.abspath(source_dir))
+    source_data = Path(source_data_dir).resolve(strict=True) if source_data_dir else source.resolve(strict=True)
+    destination = Path(destination_dir).resolve(strict=True)
+    context = Path(context_file).resolve(strict=True)
+    if source == destination:
+        raise ValueError('Source and destination state paths must differ')
+    events = read_events(root)
+    binding = bound_state(root)
+    if not binding or binding.get('migration_error'):
+        raise ValueError('A valid state binding is required')
+    obj = binding.get('objective')
+    if not isinstance(obj, dict) or objective not in (None, obj.get('id')):
+        raise ValueError('Objective does not match the existing audit binding')
+    old_state_dir = binding.get('state_dir')
+    old_identity = binding.get('identity')
+    if not isinstance(old_state_dir, str) or not Path(old_state_dir).is_absolute() or not valid_file_identity(old_identity):
+        raise ValueError('Existing state binding is incomplete')
+
+    # Idempotent recovery for a crash after the audit append but before pointer replace.
+    prior_transition = next((e for e in reversed(events) if e['kind'] == 'state_location_migration'), None)
+    if (os.path.normcase(str(destination)) == os.path.normcase(binding.get('state_dir', '')) and
+            prior_transition and prior_transition['payload'].get('new_state_dir') == str(destination)):
+        verified = _state_content(destination, obj['id'])
+        if not identity_matches(binding['identity'], verified['identity']):
+            raise ValueError('STATE_IDENTITY_DRIFT: destination changed before pointer recovery')
+        pointer_result = _advance_bootstrap_pointer(context, str(destination), binding['identity'], obj)
+        return {'state_dir': str(destination), 'identity': binding['identity'],
+                'event_id': prior_transition['seq'], 'pointer_backup': pointer_result['pointer_backup'],
+                'ok': True, 'recovered': True}
+    if os.path.normcase(str(Path(old_state_dir))) != os.path.normcase(str(source)):
+        raise ValueError('STATE_PATH_DRIFT: source directory differs from effective audit binding')
+    if any(e['kind'] == 'session_start' and e['session'] == session for e in events) is False:
+        raise ValueError('Initialize the migration session before state transition')
+
+    pointer_bytes = context.read_bytes()
+    try:
+        pointer = json.loads(pointer_bytes.decode('utf-8'))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError('Bootstrap pointer is invalid; preserve it for operator review') from exc
+    if (not isinstance(pointer, dict) or pointer.get('state_directory') is None or
+            os.path.normcase(os.path.abspath(pointer['state_directory'])) != os.path.normcase(str(source)) or
+            not identity_matches(old_identity, pointer.get('identity')) or pointer.get('objective') != obj):
+        raise ValueError('Bootstrap pointer does not match the effective source binding')
+
+    if not identity_matches(old_identity, file_identity(source_data / 'jobs.sqlite3')):
+        raise ValueError('STATE_IDENTITY_DRIFT: source ledger differs from audit binding')
+    source_info = _state_content(source_data, obj['id'])
+    destination_info = _state_content(destination, obj['id'])
+    if not identity_matches(old_identity, source_info['identity']):
+        raise ValueError('STATE_IDENTITY_DRIFT: source ledger differs from audit binding')
+    if identity_matches(source_info['identity'], destination_info['identity']):
+        raise ValueError('Destination ledger must have its own native file identity')
+    if (source_info['logical_digest'] != destination_info['logical_digest'] or
+            source_info['objective_row'] != destination_info['objective_row'] or
+            source_info['artifacts'] != destination_info['artifacts']):
+        raise ValueError('Destination logical ledger or associated artifacts differ from source')
+
+    payload = {'old_state_dir': str(source), 'old_identity': source_info['identity'],
+               'new_state_dir': str(destination), 'new_identity': destination_info['identity'],
+               'objective': obj, 'logical_sha256': source_info['logical_digest'],
+               'artifact_manifest_sha256': source_info['artifact_digest'],
+               'authorization_evidence': authorization_evidence.strip(), 'reason': reason.strip()}
+    max_seq = events[-1]['seq'] if events else 0
+    with connect(root) as con:
+        con.execute('BEGIN IMMEDIATE')
+        latest_seq = con.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
+        if latest_seq != max_seq:
+            raise ValueError('Audit journal changed during state migration verification')
+        # Recheck native file identities after acquiring the audit append lock.
+        if (not identity_matches(old_identity, file_identity(source_data / 'jobs.sqlite3')) or
+                not identity_matches(destination_info['identity'], file_identity(destination / 'jobs.sqlite3'))):
+            raise ValueError('STATE_IDENTITY_DRIFT: ledger identity changed during migration')
+        source_locked = _state_content(source_data, obj['id'])
+        destination_locked = _state_content(destination, obj['id'])
+        if (source_locked['logical_digest'] != source_info['logical_digest'] or
+                destination_locked['logical_digest'] != destination_info['logical_digest'] or
+                source_locked['artifacts'] != source_info['artifacts'] or
+                destination_locked['artifacts'] != destination_info['artifacts']):
+            raise ValueError('State contents changed during migration verification')
+        cursor = con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',
+                             (now(), session, obj['id'], 'state_location_migration', None,
+                              json.dumps(redact(payload), ensure_ascii=False, allow_nan=False)))
+        event_id = cursor.lastrowid
+    _advance_bootstrap_pointer(context, str(destination), destination_info['identity'], obj)
+    return {'state_dir': str(destination), 'identity': destination_info['identity'], 'event_id': event_id,
+            'ok': True}
+
+
+def _advance_bootstrap_pointer(context, state_dir, identity, objective):
+    pointer = json.loads(context.read_text(encoding='utf-8'))
+    if pointer.get('objective') != objective:
+        raise ValueError('Bootstrap objective changed during state transition')
+    backup = context.with_name(context.name + '.pre-state-migration')
+    original = context.read_bytes()
+    if backup.exists():
+        try:
+            saved = json.loads(backup.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError('Bootstrap migration backup is invalid; preserve it for operator review') from exc
+        if saved.get('schema_version') != 1 or saved.get('objective') != objective:
+            raise ValueError('Bootstrap migration backup collision')
+    else:
+        with backup.open('xb') as stream:
+            stream.write(original); stream.flush(); os.fsync(stream.fileno())
+    pointer['state_directory'] = state_dir
+    pointer['identity'] = identity
+    temporary = context.with_name(context.name + '.state-migration-tmp')
+    data = (json.dumps(pointer, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    if temporary.exists():
+        if temporary.read_bytes() != data:
+            raise ValueError('Bootstrap transition temporary file collision')
+    else:
+        with temporary.open('xb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+    os.replace(temporary, context)
+    return {'state_dir': state_dir, 'pointer_backup': str(backup), 'ok': True}
 
 
 def run_command(root, args, capture=None):
@@ -610,6 +802,15 @@ def main(argv=None):
     migration.add_argument('--new-python', required=True)
     migration.add_argument('--authorization-evidence', required=True)
     migration.add_argument('--reason', required=True)
+    state_migration = sub.add_parser('migrate-state-location', help='Verify a prepared copy and append a state-location transition')
+    state_migration.add_argument('--session', required=True)
+    state_migration.add_argument('--objective')
+    state_migration.add_argument('--source-dir', required=True, help='Original bound path (may be a junction to destination)')
+    state_migration.add_argument('--source-data-dir', help='Archived original data path after source archival')
+    state_migration.add_argument('--destination-dir', required=True)
+    state_migration.add_argument('--context-file', required=True)
+    state_migration.add_argument('--authorization-evidence', required=True)
+    state_migration.add_argument('--reason', required=True)
     sub.add_parser('report')
     sub.add_parser('preflight')
     a=p.parse_args(argv)
@@ -653,6 +854,12 @@ def main(argv=None):
             event_id = migrate_interpreter(a.root, a.session, a.objective, a.new_python,
                                            a.authorization_evidence, a.reason)
             print(json.dumps({'ok':True,'event_id':event_id,'interpreter':str(Path(sys.executable).resolve())}))
+        elif a.action=='migrate-state-location':
+            result = transition_state_location(a.root, a.session, a.objective, a.source_dir,
+                                               a.destination_dir, a.context_file,
+                                               a.authorization_evidence, a.reason,
+                                               source_data_dir=a.source_data_dir)
+            print(json.dumps(result, ensure_ascii=False))
         elif a.action=='check':
             require_session(a.root,a.session)
             if not a.step: raise ValueError('--step is required')

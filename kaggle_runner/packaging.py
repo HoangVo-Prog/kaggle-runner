@@ -23,6 +23,7 @@ from .config import RunnerError
 # Conservative defaults; opt-in overrides of excluded files are not supported.
 EXCLUDE_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", "__pycache__",
+    "_runner-state",
     ".pytest_cache", ".mypy_cache", ".tox", "node_modules", ".kaggle",
     ".ssh", "data", "datasets", "outputs", "output", "results", "checkpoints",
     "wandb", "build", "dist", ".idea", ".vscode", ".ruff_cache", ".cache",

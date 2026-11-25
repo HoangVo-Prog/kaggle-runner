@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import sqlite3
+import shutil
 import subprocess
 from unittest.mock import patch
 import unittest
@@ -102,6 +103,136 @@ class AuditTests(unittest.TestCase):
                             'objective':{'id':'fixture-objective','created_at':'fixture-time'},
                             'python':str(old_python.resolve()),'evidence':'temporary test fixture'})))
         return state,db,old_python
+
+    def _state_location_fixture(self):
+        source = Path(self.tmp.name) / 'state-source'; source.mkdir()
+        (source / 'work' / 'fixture-objective' / 'specs').mkdir(parents=True)
+        spec = source / 'work' / 'fixture-objective' / 'specs' / 'attempt.json'
+        spec.write_text('{"synthetic":true}', encoding='utf-8')
+        con = sqlite3.connect(source / 'jobs.sqlite3')
+        con.executescript('''
+            CREATE TABLE jobs(job_id TEXT PRIMARY KEY, status TEXT NOT NULL);
+            CREATE TABLE work_objectives(objective_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, revision INTEGER NOT NULL);
+            CREATE TABLE work_attempt_links(objective_id TEXT, ordinal INTEGER, experiment_id TEXT, attempt_id TEXT,
+                spec_path TEXT, spec_sha256 TEXT, planned_gpu_hours REAL, job_id TEXT);
+            INSERT INTO jobs VALUES('job-fixture','succeeded');
+            INSERT INTO work_objectives VALUES('fixture-objective','fixture-created-at',7);
+        ''')
+        import hashlib
+        con.execute('INSERT INTO work_attempt_links VALUES(?,?,?,?,?,?,?,?)',
+                    ('fixture-objective',0,'exp-fixture','attempt-fixture',str(spec),
+                     hashlib.sha256(spec.read_bytes()).hexdigest(),0.5,'job-fixture'))
+        con.commit(); con.close()
+        destination = Path(self.tmp.name) / 'state-destination'; destination.mkdir()
+        source_db = sqlite3.connect(source / 'jobs.sqlite3')
+        destination_db = sqlite3.connect(destination / 'jobs.sqlite3')
+        source_db.backup(destination_db)
+        destination_db.close(); source_db.close()
+        shutil.copytree(source / 'work', destination / 'work')
+        identity = audit.file_identity(source / 'jobs.sqlite3')
+        objective = {'id':'fixture-objective','created_at':'fixture-created-at'}
+        with audit.connect(self.root) as journal:
+            journal.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',
+                            (audit.now(),'a','fixture-objective','state_bound','A03',json.dumps({
+                                'state_dir':str(source.resolve()),'identity':identity,'objective':objective,
+                                'python':str(Path(sys.executable).resolve()),'evidence':'disposable state fixture'})))
+        context = Path(self.tmp.name) / '.kgr-bootstrap.json'
+        context.write_text(json.dumps({'schema_version':1,'state_directory':str(source.resolve()),
+                                       'identity':identity,'objective':objective,
+                                       'python_executable':str(Path(sys.executable).resolve()),
+                                       'runner_module':'synthetic'}), encoding='utf-8')
+        return source, destination, context, identity
+
+    def _transition_state(self, source, destination, context, authorization='operator fixture authorization'):
+        return audit.transition_state_location(self.root, 'a', 'fixture-objective', source, destination,
+                                               context, authorization, 'disposable migration test')
+
+    def test_state_location_migration_is_append_only_and_preserves_interpreter_history(self):
+        source, destination, context, _identity = self._state_location_fixture()
+        old_python = Path(self.tmp.name) / 'old-python.exe'; old_python.write_bytes(b'disposable')
+        with audit.connect(self.root) as journal:
+            journal.execute("UPDATE events SET payload=? WHERE kind='state_bound'", (json.dumps({
+                'state_dir':str(source.resolve()),'identity':audit.file_identity(source/'jobs.sqlite3'),
+                'objective':{'id':'fixture-objective','created_at':'fixture-created-at'},
+                'python':str(old_python.resolve()),'evidence':'disposable state fixture'}),))
+        self.assertEqual(self.call('migrate-interpreter','--session','a','--objective','fixture-objective',
+                                   '--new-python',sys.executable,'--authorization-evidence','operator fixture',
+                                   '--reason','synthetic interpreter history'),0)
+        before = audit.read_events(self.root)
+        result = self._transition_state(source, destination, context)
+        after = audit.read_events(self.root)
+        self.assertTrue(result['ok'])
+        self.assertEqual(after[:len(before)],before)
+        self.assertEqual(after[-1]['kind'],'state_location_migration')
+        self.assertEqual(next(e for e in after if e['kind']=='state_bound'),
+                         next(e for e in before if e['kind']=='state_bound'))
+        self.assertEqual(next(e for e in after if e['kind']=='interpreter_migration'),
+                         next(e for e in before if e['kind']=='interpreter_migration'))
+        effective = audit.bound_state(self.root)
+        self.assertEqual(effective['state_dir'],str(destination.resolve()))
+        self.assertEqual(effective['python'],str(Path(sys.executable).resolve()))
+        self.assertEqual(json.loads(context.read_text())['state_directory'],str(destination.resolve()))
+        con = sqlite3.connect(destination/'jobs.sqlite3')
+        self.assertEqual(con.execute("SELECT objective_id,created_at,revision FROM work_objectives").fetchone(),
+                         ('fixture-objective','fixture-created-at',7))
+        self.assertEqual(con.execute("SELECT experiment_id,attempt_id,spec_path FROM work_attempt_links").fetchone(),
+                         ('exp-fixture','attempt-fixture',str(source/'work'/'fixture-objective'/'specs'/'attempt.json')))
+        con.close()
+        self.assertTrue((destination/'work'/'fixture-objective'/'specs'/'attempt.json').is_file())
+
+    def test_state_location_unauthorized_and_destination_collision_are_rejected(self):
+        source, destination, context, _identity = self._state_location_fixture()
+        before = audit.read_events(self.root); pointer = context.read_bytes()
+        with self.assertRaisesRegex(ValueError,'authorization-evidence'):
+            self._transition_state(source,destination,context,authorization=' ')
+        self.assertEqual(audit.read_events(self.root),before)
+        con = sqlite3.connect(destination/'jobs.sqlite3')
+        con.execute("UPDATE jobs SET status='different'")
+        con.commit(); con.close()
+        with self.assertRaisesRegex(ValueError,'logical ledger or associated artifacts differ'):
+            self._transition_state(source,destination,context)
+        self.assertEqual(audit.read_events(self.root),before)
+        self.assertEqual(context.read_bytes(),pointer)
+
+    def test_state_location_detects_source_identity_drift(self):
+        source, destination, context, _identity = self._state_location_fixture()
+        (source/'jobs.sqlite3').rename(source/'old.sqlite3')
+        (source/'jobs.sqlite3').write_bytes(b'replacement')
+        before = audit.read_events(self.root)
+        with self.assertRaisesRegex(ValueError,'STATE_IDENTITY_DRIFT'):
+            self._transition_state(source,destination,context)
+        self.assertEqual(audit.read_events(self.root),before)
+
+    def test_state_location_recovers_interruption_after_audit_append(self):
+        source, destination, context, _identity = self._state_location_fixture()
+        with patch.object(audit,'_advance_bootstrap_pointer',side_effect=OSError('synthetic interruption')):
+            with self.assertRaisesRegex(OSError,'synthetic interruption'):
+                self._transition_state(source,destination,context)
+        self.assertEqual(audit.bound_state(self.root)['state_dir'],str(destination.resolve()))
+        self.assertEqual(json.loads(context.read_text())['state_directory'],str(source.resolve()))
+        result = self._transition_state(source,destination,context)
+        self.assertTrue(result['recovered'])
+        self.assertEqual(json.loads(context.read_text())['state_directory'],str(destination.resolve()))
+        self.assertEqual(len([e for e in audit.read_events(self.root) if e['kind']=='state_location_migration']),1)
+
+    def test_state_location_rollback_appends_reverse_transition(self):
+        source, destination, context, _identity = self._state_location_fixture()
+        self._transition_state(source,destination,context)
+        before = audit.read_events(self.root)
+        result = self._transition_state(destination,source,context)
+        after = audit.read_events(self.root)
+        self.assertTrue(result['ok'])
+        self.assertEqual(after[:len(before)],before)
+        self.assertEqual(audit.bound_state(self.root)['state_dir'],str(source.resolve()))
+        self.assertEqual(json.loads(context.read_text())['state_directory'],str(source.resolve()))
+
+    def test_state_location_cli_appends_transition(self):
+        source, destination, context, _identity = self._state_location_fixture()
+        self.assertEqual(self.call('migrate-state-location','--session','a','--objective','fixture-objective',
+                                   '--source-dir',str(source),'--destination-dir',str(destination),
+                                   '--context-file',str(context),'--authorization-evidence','operator fixture',
+                                   '--reason','CLI dispatch regression'),0)
+        self.assertEqual(audit.bound_state(self.root)['state_dir'],str(destination.resolve()))
 
     def test_authorized_interpreter_migration_is_append_only(self):
         state,db,old_python=self._bind_migration_fixture()
