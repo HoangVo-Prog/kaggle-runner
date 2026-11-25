@@ -147,6 +147,69 @@ class AuditTests(unittest.TestCase):
         return audit.transition_state_location(self.root, 'a', 'fixture-objective', source, destination,
                                                context, authorization, 'disposable migration test')
 
+    def _legacy_windows_identity(self, native):
+        self.assertEqual(native.get('platform'),'windows')
+        file_id = bytes.fromhex(native['file_id'])
+        self.assertEqual(int.from_bytes(file_id[8:],'little'),0,
+                         'Fixture must represent an identity verifiable from a historical Windows inode')
+        return {'device':int(native['volume_serial'],16),
+                'inode':int.from_bytes(file_id[:8],'little')}
+
+    def test_actual_command_sequence_accepts_legacy_v3_history_after_relocation(self):
+        source, destination, context, native_identity = self._state_location_fixture()
+        old_python = Path(self.tmp.name) / 'historical-python.exe'; old_python.write_bytes(b'disposable interpreter fixture')
+        legacy_identity = self._legacy_windows_identity(native_identity)
+        objective = {'id':'fixture-objective','created_at':'fixture-created-at'}
+        with audit.connect(self.root) as journal:
+            journal.execute("UPDATE events SET payload=? WHERE kind='state_bound'", (json.dumps({
+                'state_dir':str(source.resolve()),'identity':legacy_identity,'objective':objective,
+                'python':str(old_python.resolve()),'evidence':'legacy V3 acceptance fixture'}),))
+        context.write_text(json.dumps({'schema_version':1,'state_directory':str(source.resolve()),
+                                       'identity':legacy_identity,'objective':objective,
+                                       'python_executable':str(old_python.resolve()),
+                                       'runner_module':'synthetic'}),encoding='utf-8')
+
+        # Exercise actual V3 CLI actions under this native Windows Python process.
+        self.assertEqual(self.call('migrate-interpreter','--session','a','--objective','fixture-objective',
+                                   '--new-python',sys.executable,'--authorization-evidence','operator acceptance fixture',
+                                   '--reason','bind the canonical Python 3.11 interpreter'),0)
+        self.assertEqual(self.call('migrate-state-location','--session','a','--objective','fixture-objective',
+                                   '--source-dir',str(source),'--destination-dir',str(destination),
+                                   '--context-file',str(context),'--authorization-evidence','operator acceptance fixture',
+                                   '--reason','relocate disposable ledger'),0)
+        self.assertEqual(json.loads(context.read_text())['identity'],audit.file_identity(destination/'jobs.sqlite3'))
+
+        self.assertEqual(self.call('discover','--session','a','--objective','fixture-objective',
+                                   '--python',sys.executable,'--context-file',str(context)),0)
+        self.assertEqual(audit.bound_state(self.root)['state_dir'],str(destination.resolve()))
+        self.assertEqual(len([e for e in audit.read_events(self.root) if e['kind']=='state_bound']),1)
+        self.assertEqual(self.call('kgr','--session','a','--objective','fixture-objective',
+                                   '--python',sys.executable,'--','setup','preflight','--json'),0)
+
+    def test_state_location_checks_legacy_bootstrap_against_native_source_identity(self):
+        source, destination, context, native = self._state_location_fixture()
+        legacy = self._legacy_windows_identity(native)
+        pointer = json.loads(context.read_text())
+        pointer['identity'] = {'device':legacy['device'],'inode':legacy['inode'] + 1}
+        context.write_text(json.dumps(pointer),encoding='utf-8')
+        before = audit.read_events(self.root)
+        with self.assertRaisesRegex(ValueError,'bootstrap pointer differs from native source ledger'):
+            self._transition_state(source,destination,context)
+        self.assertEqual(audit.read_events(self.root),before)
+
+    def test_state_location_checks_legacy_audit_binding_against_native_source_identity(self):
+        source, destination, context, native = self._state_location_fixture()
+        legacy = self._legacy_windows_identity(native)
+        wrong = {'device':legacy['device'],'inode':legacy['inode'] + 1}
+        with audit.connect(self.root) as journal:
+            row = journal.execute("SELECT payload FROM events WHERE kind='state_bound'").fetchone()
+            payload = json.loads(row[0]); payload['identity'] = wrong
+            journal.execute("UPDATE events SET payload=? WHERE kind='state_bound'", (json.dumps(payload),))
+        before = audit.read_events(self.root)
+        with self.assertRaisesRegex(ValueError,'source ledger differs from audit binding'):
+            self._transition_state(source,destination,context)
+        self.assertEqual(audit.read_events(self.root),before)
+
     def test_state_location_migration_is_append_only_and_preserves_interpreter_history(self):
         source, destination, context, _identity = self._state_location_fixture()
         old_python = Path(self.tmp.name) / 'old-python.exe'; old_python.write_bytes(b'disposable')
@@ -233,6 +296,19 @@ class AuditTests(unittest.TestCase):
                                    '--context-file',str(context),'--authorization-evidence','operator fixture',
                                    '--reason','CLI dispatch regression'),0)
         self.assertEqual(audit.bound_state(self.root)['state_dir'],str(destination.resolve()))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows directory junction behavior is platform-specific')
+    def test_windows_junction_preserves_old_path_access_to_relocated_state(self):
+        target = Path(self.tmp.name) / 'junction-target'; target.mkdir()
+        marker = target / 'jobs.sqlite3'; marker.write_bytes(b'disposable marker')
+        junction = Path(self.tmp.name) / 'junction-old-path'
+        result = subprocess.run(['cmd','/c','mklink','/J',str(junction),str(target)],
+                                capture_output=True,text=True,check=False)
+        self.assertEqual(result.returncode,0,result.stdout + result.stderr)
+        self.addCleanup(lambda: os.rmdir(junction) if junction.exists() else None)
+        self.assertTrue(junction.is_dir())
+        self.assertEqual((junction/'jobs.sqlite3').read_bytes(),b'disposable marker')
+        self.assertEqual((junction/'jobs.sqlite3').resolve(),marker.resolve())
 
     def test_authorized_interpreter_migration_is_append_only(self):
         state,db,old_python=self._bind_migration_fixture()

@@ -142,6 +142,14 @@ and its rollback window closes.
 
 ## Rollback
 
+The simple reverse transition below is valid only before any new persistent
+state mutation has occurred at the destination after cutover. Once Runner has
+created or changed jobs, objectives, revisions, attempts, leases, setup history,
+specifications, reports, or downloaded artifacts there, the archived source is
+stale. Do not switch back and discard those writes. Keep the destination active
+and request a separately reviewed recovery/merge plan that preserves the newer
+state and appends further audit transitions.
+
 Quiesce Runner again. Remove the old-path junction, restore the original source
 archive to the exact old path, then use a reverse `migrate-state-location`
 transition with the current destination as `--source-dir` and the restored old

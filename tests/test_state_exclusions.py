@@ -33,6 +33,14 @@ class StateExclusionTests(unittest.TestCase):
             (state / "opaque.bin").write_bytes(b"synthetic binary state")
             (state / "work" / "fixture-objective" / "reports" / "summary.md").write_text(
                 "synthetic nested artifact", encoding="utf-8")
+            for directory in ("_runner-state.stage-fixture", "_runner-state.empty-fixture"):
+                scratch = root / directory
+                scratch.mkdir()
+                (scratch / "copy.json").write_text('{"temporary":true}', encoding="utf-8")
+                (scratch / "copy.md").write_text("temporary copy", encoding="utf-8")
+                (scratch / "copy.sqlite3").write_bytes(b"temporary database")
+            (root / ".kgr-bootstrap.json.pre-state-migration").write_text("{}", encoding="utf-8")
+            (root / ".kgr-bootstrap.json.state-migration-tmp").write_text("{}", encoding="utf-8")
 
             files = source_files(root, "main.py")
             self.assertEqual([path.as_posix() for path in files], ["main.py"])
@@ -46,6 +54,10 @@ class StateExclusionTests(unittest.TestCase):
             "_runner-state/work/fixture-objective/spec.json",
             "_runner-state/work/fixture-objective/reports/report.md",
             "_runner-state/setup-checkpoint.json",
+            "_runner-state.stage-fixture/copy.json",
+            "_runner-state.empty-fixture/copy.md",
+            ".kgr-bootstrap.json.pre-state-migration",
+            ".kgr-bootstrap.json.state-migration-tmp",
         ):
             with self.subTest(path=relative):
                 result = self._git("check-ignore", "--no-index", "-q", relative)
@@ -53,8 +65,14 @@ class StateExclusionTests(unittest.TestCase):
 
     def test_repo_source_ignore_excludes_state_directory(self):
         self.assertIn("_runner-state", __import__("kaggle_runner.packaging", fromlist=["EXCLUDE_DIRS"]).EXCLUDE_DIRS)
+        ruleset = __import__("kaggle_runner.packaging", fromlist=["EXCLUDE_DIRS"]).EXCLUDE_DIRS
+        self.assertIn("_runner-state.stage-*", ruleset)
+        self.assertIn("_runner-state.empty-*", ruleset)
         rules = (REPO / ".kaggle-runnerignore").read_text(encoding="utf-8").splitlines()
-        self.assertIn("_runner-state/", rules)
+        for rule in ("_runner-state/", "_runner-state.stage-*/", "_runner-state.empty-*/",
+                     ".kgr-bootstrap.json.pre-state-migration",
+                     ".kgr-bootstrap.json.state-migration-tmp"):
+            self.assertIn(rule, rules)
 
 
 if __name__ == "__main__":

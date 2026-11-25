@@ -23,12 +23,14 @@ from .config import RunnerError
 # Conservative defaults; opt-in overrides of excluded files are not supported.
 EXCLUDE_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", "__pycache__",
-    "_runner-state",
+    "_runner-state", "_runner-state.stage-*", "_runner-state.empty-*",
     ".pytest_cache", ".mypy_cache", ".tox", "node_modules", ".kaggle",
     ".ssh", "data", "datasets", "outputs", "output", "results", "checkpoints",
     "wandb", "build", "dist", ".idea", ".vscode", ".ruff_cache", ".cache",
 }
-EXCLUDE_FILES = {".env", "kaggle.json", "id_rsa", "id_ed25519", "credentials", "credentials.json", ".netrc", ".kgr-bootstrap.json"}
+EXCLUDE_FILES = {".env", "kaggle.json", "id_rsa", "id_ed25519", "credentials", "credentials.json", ".netrc",
+                 ".kgr-bootstrap.json", ".kgr-bootstrap.json.pre-state-migration",
+                 ".kgr-bootstrap.json.state-migration-tmp"}
 EXCLUDE_SUFFIXES = {".key", ".pem", ".p12", ".pfx", ".ckpt", ".pt", ".pth", ".safetensors", ".parquet"}
 ALLOWED_SUFFIXES = {".py", ".toml", ".txt", ".yaml", ".yml", ".json", ".cfg", ".ini", ".sh", ".md"}
 MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -116,6 +118,10 @@ def _ignored(relative: Path, patterns: list[str]) -> bool:
                (p.endswith("/") and path.startswith(p)) for p in patterns)
 
 
+def _excluded_directory(name: str) -> bool:
+    return name in EXCLUDE_DIRS or any(fnmatch.fnmatchcase(name, pattern) for pattern in EXCLUDE_DIRS if "*" in pattern)
+
+
 def source_files(root: Path, entry: str, *, include: list[str] | None = None,
                  exclude: list[str] | None = None) -> list[Path]:
     entry_path = Path(entry)
@@ -126,14 +132,14 @@ def source_files(root: Path, entry: str, *, include: list[str] | None = None,
     for current, dirs, names in os.walk(root, followlinks=False):
         base = Path(current)
         relative_dir = base.relative_to(root)
-        dirs[:] = sorted(d for d in dirs if d not in EXCLUDE_DIRS and not (base / d).is_symlink()
+        dirs[:] = sorted(d for d in dirs if not _excluded_directory(d) and not (base / d).is_symlink()
                          and not _ignored(relative_dir / d, patterns))
         for name in sorted(names):
             p = base / name
             if p.is_symlink() or not p.is_file():
                 continue
             rel = p.relative_to(root)
-            if any(part in EXCLUDE_DIRS for part in rel.parts[:-1]):
+            if any(_excluded_directory(part) for part in rel.parts[:-1]):
                 continue
             if (name.lower() in EXCLUDE_FILES or name.lower().startswith(".env.")
                 or name.lower().endswith(".local.json") or p.suffix.lower() in EXCLUDE_SUFFIXES):

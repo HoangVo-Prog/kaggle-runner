@@ -1,1 +1,5 @@
 _runner-state/
+_runner-state.stage-*/
+_runner-state.empty-*/
+.kgr-bootstrap.json.pre-state-migration
+.kgr-bootstrap.json.state-migration-tmp

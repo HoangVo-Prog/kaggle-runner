@@ -14,6 +14,7 @@ dist/
 # Local credentials / machine-specific configuration
 .kgr-bootstrap.json
 .kgr-bootstrap.json.pre-state-migration
+.kgr-bootstrap.json.state-migration-tmp
 .env
 .env.*
 !.env.example
@@ -24,6 +25,8 @@ examples/config.toml
 
 # Runner state, downloaded artifacts and experiment data
 /_runner-state/
+/_runner-state.stage-*/
+/_runner-state.empty-*/
 *.sqlite3
 *.sqlite3-*
 setup-checkpoint.json

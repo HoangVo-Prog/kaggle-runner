@@ -420,15 +420,30 @@ def bind_verified(root, session, objective, result):
             or not valid_file_identity(ident)):
         raise ValueError('Invalid discovery result; no state binding')
     path = Path(raw_path)
-    if not identity_matches(ident, file_identity(path/'jobs.sqlite3')):
+    observed_identity = file_identity(path/'jobs.sqlite3')
+    if not identity_matches(ident, observed_identity):
         raise ValueError('STATE_IDENTITY_DRIFT: ledger changed since discovery')
+    events = read_events(root)
+    effective = bound_state(root)
+    if effective and effective.get('migration_error'):
+        raise ValueError('Existing state migration evidence is invalid')
+    if effective:
+        if os.path.normcase(str(Path(effective.get('state_dir', '')).resolve())) != os.path.normcase(str(path.resolve())):
+            raise ValueError('STATE_PATH_DRIFT: discovery differs from effective authorized state binding')
+        # Compare each historical identity independently with fresh native metadata.
+        if not identity_matches(effective.get('identity'), observed_identity):
+            raise ValueError('STATE_IDENTITY_DRIFT: discovered ledger differs from effective authorized binding')
+        if effective.get('objective') != selected_objective:
+            raise ValueError('STATE_OBJECTIVE_DRIFT: discovered objective differs from effective authorized binding')
     with connect(root) as con:
         con.execute('BEGIN IMMEDIATE')
+        latest_seq = con.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
+        if latest_seq != (events[-1]['seq'] if events else 0):
+            raise ValueError('Audit journal changed during verified state binding')
         prior = [json.loads(r[0]) for r in con.execute("SELECT payload FROM events WHERE kind='state_bound'")]
-        if any(os.path.normcase(r['state_dir']) != os.path.normcase(str(path.resolve())) or
-               (r.get('identity') and not identity_matches(r['identity'], ident)) for r in prior):
-            raise ValueError('STATE_PATH_DRIFT: previous binding differs')
-        if not prior or not prior[-1].get('identity'):
+        if not effective and prior:
+            raise ValueError('STATE_PATH_DRIFT: historical binding exists but has no valid effective binding')
+        if not prior:
             payload = {'state_dir':str(path.resolve()),'identity':ident,'objective':selected['objective'],'evidence':'Verified read-only setup discover result','python':result.get('python_executable')}
             con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',(now(),session,objective,'state_bound','A03',json.dumps(redact(payload))))
     return True
@@ -629,13 +644,17 @@ def transition_state_location(root, session, objective, source_dir, destination_
         pointer = json.loads(pointer_bytes.decode('utf-8'))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError('Bootstrap pointer is invalid; preserve it for operator review') from exc
-    if (not isinstance(pointer, dict) or pointer.get('state_directory') is None or
+    if (not isinstance(pointer, dict) or not isinstance(pointer.get('state_directory'), str) or
             os.path.normcase(os.path.abspath(pointer['state_directory'])) != os.path.normcase(str(source)) or
-            not identity_matches(old_identity, pointer.get('identity')) or pointer.get('objective') != obj):
-        raise ValueError('Bootstrap pointer does not match the effective source binding')
+            pointer.get('objective') != obj):
+        raise ValueError('Bootstrap pointer path/objective does not match the effective source binding')
 
-    if not identity_matches(old_identity, file_identity(source_data / 'jobs.sqlite3')):
+    source_observed_identity = file_identity(source_data / 'jobs.sqlite3')
+    if not identity_matches(old_identity, source_observed_identity):
         raise ValueError('STATE_IDENTITY_DRIFT: source ledger differs from audit binding')
+    # Stored legacy identities must each be checked against native file metadata.
+    if not identity_matches(pointer.get('identity'), source_observed_identity):
+        raise ValueError('STATE_IDENTITY_DRIFT: bootstrap pointer differs from native source ledger')
     source_info = _state_content(source_data, obj['id'])
     destination_info = _state_content(destination, obj['id'])
     if not identity_matches(old_identity, source_info['identity']):
