@@ -18,6 +18,11 @@ import time
 import uuid
 
 HERE = Path(__file__).resolve().parent
+RUNNER_ROOT = HERE.parents[1]
+if str(RUNNER_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNNER_ROOT))
+from kaggle_runner.file_identity import file_identity, identity_matches, valid_file_identity
+
 STATES = ('todo', 'in_progress', 'done', 'blocked', 'skipped', 'stale')
 KINDS = ('decision', 'observation', 'incident', 'doc_read', 'intervention', 'handoff', 'approval_note', 'retry', 'workaround', 'state_drift', 'escalation', 'operator_request')
 CATEGORIES = ('runner', 'testbed', 'environment', 'documentation', 'authorization', 'science', 'unconfirmed', 'agent_invocation', 'bootstrap')
@@ -215,6 +220,7 @@ def startup(root, session, objective, runner_root):
                testbed_version=VERSION, agents_sha256=agent_hash, revision=revision,
                branch=branch, tracked_worktree_status=status, git_attempts=attempts,
                identity=getpass.getuser(), os=platform.platform(), python=sys.executable,
+               python_version=platform.python_version(),
                repo_root=str(runner_root), audit_root=str(root.resolve()),
                startup_evidence_complete=revision is not None and status is not None and branch is not None)
 
@@ -347,8 +353,32 @@ def runner_tail(argv):
 
 
 def bound_state(root):
-    bindings = [e['payload'] for e in read_events(root) if e['kind']=='state_bound']
-    return bindings[-1] if bindings else None
+    events = read_events(root)
+    bindings = [e for e in events if e['kind']=='state_bound']
+    if not bindings:
+        return None
+    binding_event = bindings[-1]
+    binding = dict(binding_event['payload'])
+    for event in events:
+        if event['seq'] <= binding_event['seq'] or event['kind'] != 'interpreter_migration':
+            continue
+        migration = event['payload']
+        old = migration.get('old_interpreter')
+        new = migration.get('new_interpreter')
+        if (not isinstance(old, dict) or not isinstance(new, dict) or
+                not isinstance(binding.get('python'), str) or
+                os.path.normcase(old.get('path', '')) != os.path.normcase(binding['python']) or
+                not isinstance(new.get('path'), str) or not Path(new['path']).is_absolute() or
+                not valid_file_identity(new.get('file_identity')) or
+                not migration.get('authorization_evidence') or
+                os.path.normcase(migration.get('state_dir', '')) != os.path.normcase(binding.get('state_dir', '')) or
+                not identity_matches(binding.get('identity'), migration.get('state_identity'))):
+            binding['migration_error'] = 'invalid_interpreter_migration_record'
+            return binding
+        binding['python'] = new['path']
+        binding['python_identity'] = new['file_identity']
+        binding['python_version'] = new.get('version')
+    return binding
 
 
 def bind_verified(root, session, objective, result):
@@ -370,22 +400,120 @@ def bind_verified(root, session, objective, result):
             or selected_objective.get('id') != objective
             or not isinstance(raw_path, str) or not Path(raw_path).is_absolute()
             or not isinstance(python, str) or not Path(python).is_absolute()
-            or not isinstance(ident, dict) or set(ident) != {'device', 'inode'}
-            or any(type(v) is not int for v in ident.values()) or not ident['inode']):
+            or not valid_file_identity(ident)):
         raise ValueError('Invalid discovery result; no state binding')
     path = Path(raw_path)
-    db = (path/'jobs.sqlite3').stat()
-    if ident != {'device':db.st_dev,'inode':db.st_ino}:
+    if not identity_matches(ident, file_identity(path/'jobs.sqlite3')):
         raise ValueError('STATE_IDENTITY_DRIFT: ledger changed since discovery')
     with connect(root) as con:
         con.execute('BEGIN IMMEDIATE')
         prior = [json.loads(r[0]) for r in con.execute("SELECT payload FROM events WHERE kind='state_bound'")]
-        if any(os.path.normcase(r['state_dir']) != os.path.normcase(str(path.resolve())) or (r.get('identity') and r['identity']!=ident) for r in prior):
+        if any(os.path.normcase(r['state_dir']) != os.path.normcase(str(path.resolve())) or
+               (r.get('identity') and not identity_matches(r['identity'], ident)) for r in prior):
             raise ValueError('STATE_PATH_DRIFT: previous binding differs')
         if not prior or not prior[-1].get('identity'):
             payload = {'state_dir':str(path.resolve()),'identity':ident,'objective':selected['objective'],'evidence':'Verified read-only setup discover result','python':result.get('python_executable')}
             con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',(now(),session,objective,'state_bound','A03',json.dumps(redact(payload))))
     return True
+
+
+def interpreter_record(path, version=None):
+    executable = Path(path).resolve(strict=True)
+    if not executable.is_file():
+        raise ValueError('Interpreter path is not a regular file')
+    return {'path': str(executable), 'file_identity': file_identity(executable), 'version': version}
+
+
+def migrate_interpreter(root, session, objective, new_python, authorization_evidence, reason):
+    """Append an explicitly authorized interpreter transition to a V3 audit."""
+    if not authorization_evidence or not authorization_evidence.strip():
+        raise ValueError('Explicit --authorization-evidence is required')
+    if not reason or not reason.strip():
+        raise ValueError('A migration reason is required')
+    target = Path(new_python)
+    if not target.is_absolute():
+        raise ValueError('--new-python must be an absolute interpreter path')
+    target = target.resolve(strict=True)
+    if os.path.normcase(str(target)) != os.path.normcase(str(Path(sys.executable).resolve())):
+        raise ValueError('Migration target must be the interpreter running this audit command')
+
+    events = read_events(root)
+    session_start = next((event for event in events
+                          if event['kind'] == 'session_start' and event['session'] == session), None)
+    if (session_start is None or
+            os.path.normcase(str(Path(session_start['payload'].get('python', '')).resolve())) !=
+            os.path.normcase(str(target))):
+        raise ValueError('Initialize the migration session under the explicitly selected interpreter')
+    bindings = [event for event in events if event['kind'] == 'state_bound']
+    if not bindings:
+        raise ValueError('A verified state binding is required before interpreter migration')
+    base_event = bindings[-1]
+    base = base_event['payload']
+    effective = bound_state(root)
+    if effective and effective.get('migration_error'):
+        raise ValueError('Existing interpreter migration evidence is invalid')
+    state_dir = base.get('state_dir')
+    identity = base.get('identity')
+    obj = base.get('objective')
+    old_path = (effective or {}).get('python') or base.get('python')
+    if (not isinstance(state_dir, str) or not Path(state_dir).is_absolute() or
+            not valid_file_identity(identity) or not isinstance(obj, dict) or
+            not isinstance(obj.get('id'), str) or objective not in (None, obj['id']) or
+            not isinstance(old_path, str) or not Path(old_path).is_absolute()):
+        raise ValueError('Existing state binding is incomplete or malformed')
+    if os.path.normcase(str(Path(old_path).resolve())) == os.path.normcase(str(target)):
+        raise ValueError('The requested interpreter is already bound')
+
+    ledger = Path(state_dir) / 'jobs.sqlite3'
+    observed = file_identity(ledger)
+    if not identity_matches(identity, observed):
+        raise ValueError('STATE_IDENTITY_DRIFT: bound ledger does not match its verified identity')
+
+    # Legacy bindings did not store executable file IDs. Inspect the old path
+    # as metadata only; never execute it. If it is unavailable, fail closed.
+    old_version = (effective or {}).get('python_version')
+    for event in events:
+        if event['kind'] == 'session_start' and os.path.normcase(event['payload'].get('python', '')) == os.path.normcase(old_path):
+            old_version = old_version or event['payload'].get('python_version')
+    old_record = interpreter_record(old_path, old_version)
+    new_record = interpreter_record(target, platform.python_version())
+    if (effective or {}).get('python_identity') and not identity_matches(effective['python_identity'], old_record['file_identity']):
+        raise ValueError('The currently authorized interpreter file identity changed')
+
+    payload = {
+        'state_dir': str(Path(state_dir).resolve()),
+        'state_identity': observed,
+        'objective': obj,
+        'old_interpreter': old_record,
+        'new_interpreter': new_record,
+        'authorization_evidence': authorization_evidence.strip(),
+        'reason': reason.strip(),
+    }
+    # Recheck after taking the append lock. This event authorizes a toolchain
+    # transition only for the same ledger identity that the binding records.
+    with connect(root) as con:
+        con.execute('BEGIN IMMEDIATE')
+        latest = con.execute("SELECT seq,payload FROM events WHERE kind='state_bound' ORDER BY seq DESC LIMIT 1").fetchone()
+        if latest is None or latest['seq'] != base_event['seq'] or json.loads(latest['payload']) != base:
+            raise ValueError('State binding changed during interpreter migration')
+        latest_migration = con.execute(
+            "SELECT seq,payload FROM events WHERE kind='interpreter_migration' AND seq>? ORDER BY seq DESC LIMIT 1",
+            (base_event['seq'],)).fetchone()
+        from_path = (json.loads(latest_migration['payload']).get('new_interpreter', {}).get('path')
+                     if latest_migration else base.get('python'))
+        if os.path.normcase(str(from_path or '')) != os.path.normcase(old_record['path']):
+            raise ValueError('Interpreter binding changed during migration')
+        if not identity_matches(identity, file_identity(ledger)):
+            raise ValueError('STATE_IDENTITY_DRIFT: bound ledger changed during interpreter migration')
+        if (not identity_matches(old_record['file_identity'], file_identity(old_record['path'])) or
+                not identity_matches(new_record['file_identity'], file_identity(new_record['path']))):
+            raise ValueError('Interpreter file identity changed during migration')
+        if os.path.normcase(str(target)) == os.path.normcase(str(Path(sys.executable).resolve())):
+            cur = con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',
+                              (now(), session, obj['id'], 'interpreter_migration', None,
+                               json.dumps(redact(payload), ensure_ascii=False, allow_nan=False)))
+            return cur.lastrowid
+    raise ValueError('Interpreter migration was not recorded')
 
 
 def run_command(root, args, capture=None):
@@ -401,11 +529,13 @@ def run_command(root, args, capture=None):
     command, given = runner_tail(argv)
     if command is not None and command not in STATELESS and not any(t in ('--help','-h','--version') for t in argv):
         bound = bound_state(root)
+        if bound and bound.get('migration_error'):
+            print('INTERPRETER_MIGRATION_INVALID: operator review required', file=sys.stderr)
+            return 3
         valid = bool(bound and bound.get('identity') and given and Path(given).is_absolute() and os.path.normcase(str(Path(given).resolve())) == os.path.normcase(bound['state_dir']))
         if valid and bound.get('identity'):
             try:
-                st=(Path(given)/'jobs.sqlite3').stat()
-                valid = bound['identity']=={'device':st.st_dev,'inode':st.st_ino}
+                valid = identity_matches(bound['identity'], file_identity(Path(given)/'jobs.sqlite3'))
             except OSError:
                 valid = False
         if not valid:
@@ -474,6 +604,12 @@ def main(argv=None):
             q.add_argument('--state-dir',help='Optional explicitly confirmed existing path')
             q.add_argument('--context-file',help='Optional absolute bootstrap context path')
         else: q.add_argument('argv',nargs=argparse.REMAINDER)
+    migration = sub.add_parser('migrate-interpreter', help='Append an explicitly authorized interpreter migration')
+    migration.add_argument('--session', required=True)
+    migration.add_argument('--objective')
+    migration.add_argument('--new-python', required=True)
+    migration.add_argument('--authorization-evidence', required=True)
+    migration.add_argument('--reason', required=True)
     sub.add_parser('report')
     sub.add_parser('preflight')
     a=p.parse_args(argv)
@@ -513,6 +649,10 @@ def main(argv=None):
             if a.kind=='operator_request' and not a.request_class: raise ValueError('Operator requests require --request-class')
             require_session(a.root,a.session)
             print(add(a.root,a.session,a.kind,a.step,a.objective,summary=a.summary,reason=a.reason,evidence=a.evidence,alternatives=a.alternatives,expected=a.expected,category=a.category,request_class=a.request_class))
+        elif a.action=='migrate-interpreter':
+            event_id = migrate_interpreter(a.root, a.session, a.objective, a.new_python,
+                                           a.authorization_evidence, a.reason)
+            print(json.dumps({'ok':True,'event_id':event_id,'interpreter':str(Path(sys.executable).resolve())}))
         elif a.action=='check':
             require_session(a.root,a.session)
             if not a.step: raise ValueError('--step is required')
@@ -521,6 +661,8 @@ def main(argv=None):
             print(add(a.root,a.session,'check',a.step,a.objective,status=a.status,evidence=a.evidence))
         elif a.action in ('discover','kgr'):
             bound = bound_state(a.root)
+            if bound and bound.get('migration_error'):
+                raise ValueError('Invalid interpreter migration evidence; preserve the binding and request operator review')
             python = a.python or (bound or {}).get('python') or sys.executable
             a.live=False; a.approval_reference=None
             if a.python and not Path(a.python).is_absolute(): raise ValueError('--python must be the absolute verified interpreter path')
@@ -531,8 +673,7 @@ def main(argv=None):
                     if a.state_dir and os.path.normcase(str(Path(a.state_dir).resolve())) != os.path.normcase(bound['state_dir']):
                         raise ValueError('STATE_PATH_DRIFT: discovery cannot replace an existing audit binding')
                     if bound.get('identity'):
-                        st=(Path(bound['state_dir'])/'jobs.sqlite3').stat()
-                        if bound['identity'] != {'device':st.st_dev,'inode':st.st_ino}:
+                        if not identity_matches(bound['identity'], file_identity(Path(bound['state_dir'])/'jobs.sqlite3')):
                             raise ValueError('STATE_IDENTITY_DRIFT: bound ledger replaced')
                     a.state_dir=bound['state_dir']
                 if not a.objective: raise ValueError('Discovery requires an objective ID')

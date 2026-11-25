@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from kaggle_runner.state_discovery import discover
+from kaggle_runner.file_identity import file_identity
 
 
 class StateDiscoveryTests(unittest.TestCase):
@@ -40,6 +41,40 @@ class StateDiscoveryTests(unittest.TestCase):
     def test_default_discovery_does_not_write(self):
         state=self.ledger('existing'); os.environ['KGR_STATE_DIR']=str(state)
         self.assertTrue(self.probe()['ok']); self.assertFalse(self.context.exists())
+    def test_verified_discovery_accepts_full_width_legacy_identity(self):
+        state=self.ledger('existing'); os.environ['KGR_STATE_DIR']=str(state)
+        identity=file_identity(state/'jobs.sqlite3')
+        if identity.get('platform') == 'windows':
+            file_id=bytes.fromhex(identity['file_id'])
+            legacy={'device':int(identity['volume_serial'],16),
+                    'inode':int.from_bytes(file_id[:8],'little')}
+        else:
+            legacy=identity
+        self.context.write_text(json.dumps({
+            'schema_version':1,'state_directory':str(state),'identity':legacy,
+            'objective':{'id':'target-objective','created_at':'2026-01-01T00:00:00Z'},
+            'python_executable':'legacy-python','runner_module':'legacy-module',
+        }),encoding='utf-8')
+        result=self.probe()
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['selected']['path'],str(state))
+        if os.name == 'nt':
+            self.assertNotEqual(result['selected']['identity'],legacy)
+    def test_truncated_windows_legacy_device_is_ambiguous(self):
+        if os.name != 'nt': self.skipTest('Windows device truncation only')
+        state=self.ledger('existing'); os.environ['KGR_STATE_DIR']=str(state)
+        identity=file_identity(state/'jobs.sqlite3')
+        file_id=bytes.fromhex(identity['file_id'])
+        legacy={'device':int(identity['volume_serial'],16)&0xFFFFFFFF,
+                'inode':int.from_bytes(file_id[:8],'little')}
+        self.context.write_text(json.dumps({
+            'schema_version':1,'state_directory':str(state),'identity':legacy,
+            'objective':{'id':'target-objective','created_at':'2026-01-01T00:00:00Z'},
+            'python_executable':'legacy-python','runner_module':'legacy-module',
+        }),encoding='utf-8')
+        result=self.probe()
+        self.assertEqual(result['status'],'blocked')
+        self.assertIn({'source':'bootstrap_context','error_type':'STATE_IDENTITY_DRIFT'},result['problems'])
     def test_ambiguous_matches(self):
         a=self.ledger('one'); b=self.ledger('two'); os.environ['KGR_STATE_DIR']=str(a)
         self.config.write_text('[runner]\nstate_dir='+json.dumps(str(b))+'\n')

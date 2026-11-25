@@ -11,6 +11,7 @@ import sys
 import tomllib
 
 from .config import default_config_path, state_directory
+from .file_identity import file_identity, identity_matches
 
 CONTEXT_NAME = '.kgr-bootstrap.json'
 ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{2,119}\Z')
@@ -27,7 +28,7 @@ def ledger_identity(path: Path, objective_id: str | None = None) -> dict:
     """Read only the schema and requested objective, never credential/job data."""
     db = path / 'jobs.sqlite3'
     try:
-        before = db.stat()
+        before = file_identity(db)
         if not db.is_file():
             return {'status': 'unreadable', 'reason': 'ledger_not_regular_file'}
         # A WAL database without an existing shared-memory file may require SQLite
@@ -44,15 +45,11 @@ def ledger_identity(path: Path, objective_id: str | None = None) -> dict:
             row = None
             if objective_id and 'work_objectives' in tables:
                 row = con.execute('SELECT objective_id,created_at FROM work_objectives WHERE objective_id=?', (objective_id,)).fetchone()
-        after = db.stat()
-        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        after = file_identity(db)
+        if before != after:
             return {'status': 'unreadable', 'reason': 'ledger_changed_during_probe'}
-        # Inodes are identity evidence, not a content hash or an authorization.
-        if not after.st_ino:
-            return {'status': 'unreadable', 'reason': 'stable_file_identity_unavailable'}
-        ident = {'device': after.st_dev, 'inode': after.st_ino}
         return {'status': 'match' if row else 'objective_absent' if objective_id else 'ledger_present',
-                'identity': ident, 'objective': {'id': row[0], 'created_at': row[1]} if row else None}
+                'identity': after, 'objective': {'id': row[0], 'created_at': row[1]} if row else None}
     except FileNotFoundError:
         return {'status': 'missing'}
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -166,7 +163,7 @@ def discover(*, objective_id=None, state_dir=None, config=None, context_file=Non
         try:
             pin = absolute(cached['state_directory'])
             check = ledger_identity(pin, cached['objective']['id'])
-            pin_ok = (check['status'] == 'match' and check['identity'] == cached['identity'] and
+            pin_ok = (check['status'] == 'match' and identity_matches(cached['identity'], check['identity']) and
                       check['objective'] == cached['objective'])
         except (OSError, ValueError, KeyError, RuntimeError):
             pin_ok = False

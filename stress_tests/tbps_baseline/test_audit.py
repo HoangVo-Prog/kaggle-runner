@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import sqlite3
@@ -13,6 +14,11 @@ import audit
 class AuditTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        # The desktop host may inject a partial indexed Git config. Keep all
+        # temporary-repository operations isolated from that inherited state.
+        clean_env={k:v for k,v in os.environ.items() if not k.startswith('GIT_CONFIG_')}
+        self.git_env_patch=patch.dict(os.environ,clean_env,clear=True)
+        self.git_env_patch.start(); self.addCleanup(self.git_env_patch.stop)
         self.root=Path(self.tmp.name)/'runtime_v3'
         self.repo=Path(self.tmp.name)/'repo'; self.repo.mkdir()
         (self.repo/'AGENTS.md').write_text('test instructions',encoding='utf-8')
@@ -85,6 +91,63 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(self.call('run','--session','a','--','kgr','--state-dir',str(state),'setup','verify','--online'),3)
         self.assertEqual(audit.report(self.root)['commands_finished'],0)
 
+    def _bind_migration_fixture(self):
+        state=Path(self.tmp.name)/'migration-state'; state.mkdir()
+        db=state/'jobs.sqlite3'; db.write_bytes(b'disposable ledger identity fixture')
+        old_python=Path(self.tmp.name)/'old-python.exe'; old_python.write_bytes(b'disposable old interpreter fixture')
+        with audit.connect(self.root) as con:
+            con.execute('INSERT INTO events(ts,session,objective,kind,step,payload) VALUES(?,?,?,?,?,?)',
+                        (audit.now(),'a','fixture-objective','state_bound','A03',json.dumps({
+                            'state_dir':str(state.resolve()),'identity':audit.file_identity(db),
+                            'objective':{'id':'fixture-objective','created_at':'fixture-time'},
+                            'python':str(old_python.resolve()),'evidence':'temporary test fixture'})))
+        return state,db,old_python
+
+    def test_authorized_interpreter_migration_is_append_only(self):
+        state,db,old_python=self._bind_migration_fixture()
+        before=audit.read_events(self.root)
+        code=self.call('migrate-interpreter','--session','a','--objective','fixture-objective',
+                       '--new-python',sys.executable,
+                       '--authorization-evidence','operator explicitly authorized fixture migration',
+                       '--reason','temporary audit regression')
+        self.assertEqual(code,0)
+        after=audit.read_events(self.root)
+        self.assertEqual(after[:len(before)],before)
+        self.assertEqual(len(after),len(before)+1)
+        event=after[-1]
+        self.assertEqual(event['kind'],'interpreter_migration')
+        self.assertEqual(event['payload']['old_interpreter']['path'],str(old_python.resolve()))
+        self.assertEqual(event['payload']['new_interpreter']['path'],str(Path(sys.executable).resolve()))
+        self.assertEqual(event['payload']['state_identity'],audit.file_identity(db))
+        self.assertEqual(audit.bound_state(self.root)['python'],str(Path(sys.executable).resolve()))
+        # Historical state binding remains byte-for-byte represented by its original event.
+        original_binding=next(e for e in before if e['kind']=='state_bound')
+        self.assertEqual(next(e for e in after if e['kind']=='state_bound'),original_binding)
+        from unittest.mock import MagicMock
+        with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout='{}',stderr='')) as run:
+            self.assertEqual(self.call('kgr','--python',sys.executable,'--','work','show','fixture-objective'),0)
+            self.assertIn(str(state.resolve()),run.call_args.args[0])
+
+    def test_unauthorized_interpreter_migration_is_rejected(self):
+        _state,_db,old_python=self._bind_migration_fixture()
+        before=audit.read_events(self.root)
+        with self.assertRaisesRegex(ValueError,'authorization-evidence'):
+            audit.migrate_interpreter(self.root,'a','fixture-objective',sys.executable,'',
+                                      'missing operator authorization')
+        after=audit.read_events(self.root)
+        self.assertEqual(after,before)
+        self.assertEqual(audit.bound_state(self.root)['python'],str(old_python.resolve()))
+        self.assertEqual(self.call('kgr','--python',sys.executable,'--','work','show','fixture-objective'),2)
+
+    def test_interpreter_migration_rejects_replaced_ledger(self):
+        state,db,_old_python=self._bind_migration_fixture()
+        db.rename(state/'previous.sqlite3')
+        db.write_bytes(b'replacement ledger fixture')
+        with self.assertRaisesRegex(ValueError,'STATE_IDENTITY_DRIFT'):
+            audit.migrate_interpreter(self.root,'a','fixture-objective',sys.executable,
+                                      'operator authorized fixture', 'replacement check')
+        self.assertFalse(any(e['kind']=='interpreter_migration' for e in audit.read_events(self.root)))
+
     def test_startup_and_export(self):
         events=audit.read_events(self.root)
         first=events[0]; self.assertEqual(first['kind'],'session_start')
@@ -109,7 +172,13 @@ class AuditTests(unittest.TestCase):
         from unittest.mock import MagicMock
         state=Path(self.tmp.name)/'state'; state.mkdir()
         db=state/'jobs.sqlite3'; db.write_bytes(b'fixture')
-        st=db.stat(); ident={'device':st.st_dev,'inode':st.st_ino}
+        current_ident=audit.file_identity(db)
+        if current_ident.get('platform') == 'windows':
+            file_id=bytes.fromhex(current_ident['file_id'])
+            ident={'device':int(current_ident['volume_serial'],16),
+                   'inode':int.from_bytes(file_id[:8],'little')}
+        else:
+            ident=current_ident
         selected={'path':str(state),'status':'match','identity':ident,'objective':{'id':'fixture','created_at':'time'}}
         result={'schema_version':1,'offline':True,'objective_id':'fixture','ok':True,'status':'verified','selected':selected,'candidates':[selected],'problems':[],'python_executable':sys.executable,'authorization':'not_checked','context_status':'saved'}
         with patch('audit.subprocess.run',return_value=MagicMock(returncode=0,stdout=json.dumps(result),stderr='')):
@@ -179,8 +248,7 @@ class AuditTests(unittest.TestCase):
         from unittest.mock import MagicMock
         state=Path(self.tmp.name)/'state'; state.mkdir()
         db=state/'jobs.sqlite3'; db.write_bytes(b'fixture')
-        st=db.stat()
-        selected={'path':str(state),'status':'match','identity':{'device':st.st_dev,'inode':st.st_ino},
+        selected={'path':str(state),'status':'match','identity':audit.file_identity(db),
                   'objective':{'id':'fixture','created_at':'time'}}
         result={'schema_version':1,'offline':True,'objective_id':'fixture','ok':True,'status':'verified',
                 'selected':selected,'candidates':[selected,dict(selected,path=str(state/'other'))],
